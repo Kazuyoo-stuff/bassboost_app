@@ -51,35 +51,6 @@ gradle assembleRelease
 The repository does not ship the Gradle wrapper, so use a local Gradle installation.
 The unsigned APK installed successfully as a privileged app on the tested device.
 
-## Install as a system app (KernelSU / Magisk module)
-
-Module layout:
-
-```
-META-INF/com/google/android/
-  update-binary   (magisk busybox sh)
-  updater-script  (#MAGISK)
-module.prop
-system/
-  priv-app/
-    BassBoost/
-      BassBoost.apk
-```
-
-`module.prop`:
-
-```
-id=kazuyoo-bassboost
-name=Kazuyoo BassBoost
-version=v1.0
-versionCode=1
-author=kazuyoo
-description=Global BassBoost daemon, no UI
-```
-
-Install the module from the KernelSU Manager and reboot. To update, replace the APK inside
-the module and reboot.
-
 ## Configuration
 
 Commands must be run from a root shell. Every change is applied immediately to the running
