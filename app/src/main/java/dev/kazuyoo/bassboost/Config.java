@@ -32,6 +32,7 @@ public class Config extends SQLiteOpenHelper {
     public static final int DEFAULT_DP_GAIN           = 6;    /* dB, 0-15, bass gain up to mid volume */
     public static final int DEFAULT_DP_GAIN_MAX       = 4;    /* dB, 0-15, bass gain at max volume */
     public static final int DEFAULT_ADAPTIVE          = 1;    /* 1 = taper gain as volume rises */
+    public static final int DEFAULT_CLARITY           = 0;    /* 1 = multiband vocal/presence control */
 
     private final Map<String, Integer> mCache = new ConcurrentHashMap<>();
     private final ExecutorService      mIo    = Executors.newSingleThreadExecutor();
@@ -57,6 +58,7 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "dp_gain",          DEFAULT_DP_GAIN);
         insert(db, "dp_gain_max",      DEFAULT_DP_GAIN_MAX);
         insert(db, "adaptive",         DEFAULT_ADAPTIVE);
+        insert(db, "clarity",          DEFAULT_CLARITY);
     }
 
     @Override
