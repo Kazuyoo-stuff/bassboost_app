@@ -32,6 +32,7 @@ public class BassService extends Service {
     public static final String ACTION_SET_LOUDNESS_TARGET  = "dev.kazuyoo.bassboost.SET_LOUDNESS_TARGET";
     public static final String ACTION_SET_BASS_ENABLED     = "dev.kazuyoo.bassboost.SET_BASS_ENABLED";
     public static final String ACTION_SET_LOUDNESS_ENABLED = "dev.kazuyoo.bassboost.SET_LOUDNESS_ENABLED";
+    public static final String ACTION_SET_LOUDNESS_LOW     = "dev.kazuyoo.bassboost.SET_LOUDNESS_LOW";
     public static final String ACTION_SET_LOW_GAIN         = "dev.kazuyoo.bassboost.SET_LOW_GAIN";
     public static final String ACTION_SET_HIGH_VOL_GAIN    = "dev.kazuyoo.bassboost.SET_HIGH_VOL_GAIN";
     public static final String ACTION_SET_ADAPTIVE         = "dev.kazuyoo.bassboost.SET_ADAPTIVE";
@@ -47,10 +48,13 @@ public class BassService extends Service {
     private static final String EXTRA_STREAM_TYPE      = "android.media.EXTRA_VOLUME_STREAM_TYPE";
 
     /*
-     * Adaptive curve. Up to KNEE of the max music volume everything stays at the
-     * configured "quiet" values (identical to v1.1: full bass gain, loudness target,
-     * fast/hard limiter). Above it, factor t rises 0 -> 1 and bass gain, loudness and
-     * the limiter all move towards their gentler "max volume" values.
+     * Adaptive curve, r = music volume as a fraction of its range.
+     *  - r below KNEE: bass gain and limiter stay at the "quiet" values (same as v1.1),
+     *    while loudness gets an extra boost (loudness_low) that is largest at minimum
+     *    volume and fades to nothing at KNEE, compensating for the ear's weak low-volume
+     *    sensitivity.
+     *  - r above KNEE: factor t rises 0 -> 1 and bass gain, loudness and the limiter all
+     *    move towards their gentler "max volume" values.
      */
     private static final float KNEE = 0.5f;
 
@@ -68,7 +72,7 @@ public class BassService extends Service {
     private Config             mConfig;
     private AudioManager       mAudio;
 
-    private float   mAppliedT = Float.NaN;
+    private float   mAppliedR = Float.NaN;
     private boolean mReceiverRegistered = false;
     private boolean mPlaying    = false;
     private boolean mPolling    = false;
@@ -169,6 +173,11 @@ public class BassService extends Service {
                 case ACTION_SET_LOUDNESS_TARGET:
                     /* millibels: 0 = no gain, 600 = +6 dB */
                     mConfig.set("loudness_target", clamp(value, 0, 2000));
+                    syncLoudness();
+                    break;
+                case ACTION_SET_LOUDNESS_LOW:
+                    /* millibels of extra loudness at minimum volume */
+                    mConfig.set("loudness_low", clamp(value, 0, 1000));
                     syncLoudness();
                     break;
                 case ACTION_SET_LOUDNESS_ENABLED:
@@ -348,7 +357,7 @@ public class BassService extends Service {
             try { mLoudness.release(); } catch (Exception ignored) {}
             mLoudness = null;
         }
-        mAppliedT = Float.NaN;
+        mAppliedR = Float.NaN;
     }
 
     private void releaseDp() {
@@ -356,7 +365,7 @@ public class BassService extends Service {
             try { mDp.release(); } catch (Exception ignored) {}
             mDp = null;
         }
-        mAppliedT = Float.NaN;
+        mAppliedR = Float.NaN;
     }
 
     /** Re-creates any effect that should exist but does not (e.g. it failed during boot). */
@@ -406,9 +415,9 @@ public class BassService extends Service {
         }
     }
 
-    /** 0 up to KNEE of the max music volume, rising linearly to 1 at max volume. */
-    private float volumeFactor() {
-        if (mConfig.get("adaptive", Config.DEFAULT_ADAPTIVE) != 1) return 0f;
+    /** Music volume as 0..1, or -1 when adaptive mode is off or the volume cannot be read. */
+    private float volumeRatio() {
+        if (mConfig.get("adaptive", Config.DEFAULT_ADAPTIVE) != 1) return -1f;
         try {
             if (mVolMax < 0) {
                 mVolMin = mAudio.getStreamMinVolume(AudioManager.STREAM_MUSIC);
@@ -416,13 +425,22 @@ public class BassService extends Service {
             }
             int min = mVolMin;
             int max = mVolMax;
-            if (max <= min) return 0f;
+            if (max <= min) return -1f;
             float r = (mAudio.getStreamVolume(AudioManager.STREAM_MUSIC) - min) / (float) (max - min);
-            r = Math.max(0f, Math.min(1f, r));
-            return r <= KNEE ? 0f : (r - KNEE) / (1f - KNEE);
+            return Math.max(0f, Math.min(1f, r));
         } catch (Exception e) {
-            return 0f;
+            return -1f;
         }
+    }
+
+    /** 0 up to KNEE, rising linearly to 1 at maximum volume. */
+    private static float tailFactor(float r) {
+        return r <= KNEE ? 0f : (r - KNEE) / (1f - KNEE);
+    }
+
+    /** 1 at minimum volume, fading to 0 at KNEE (0 when adaptive mode is off). */
+    private static float lowFactor(float r) {
+        return (r < 0f || r >= KNEE) ? 0f : 1f - r / KNEE;
     }
 
     private float gainFor(float t) {
@@ -432,18 +450,22 @@ public class BassService extends Service {
         return Math.round(g * 2f) / 2f; /* 0.5 dB steps */
     }
 
-    private int loudnessFor(float t) {
-        int base = clamp(mConfig.get("loudness_target", Config.DEFAULT_LOUDNESS_TARGET), 0, 2000);
-        return Math.round(base * (1f - t) / 10f) * 10; /* 10 mB steps */
+    private int loudnessFor(float r) {
+        int base  = clamp(mConfig.get("loudness_target", Config.DEFAULT_LOUDNESS_TARGET), 0, 2000);
+        int extra = clamp(mConfig.get("loudness_low",    Config.DEFAULT_LOUDNESS_LOW),    0, 1000);
+        float mb = (base + extra * lowFactor(r)) * (1f - tailFactor(r));
+        return Math.round(mb / 10f) * 10; /* 10 mB steps */
     }
 
     /**
      * Pushes every volume-dependent value (bass gain, limiter, loudness) to the effects.
-     * The factor is quantised to 0.1 so nothing is touched unless it really changed.
+     * The volume is quantised to 5% steps so nothing is touched unless it really changed.
      */
     private void applyAdaptive(boolean force) {
-        float t = Math.round(volumeFactor() * 10f) / 10f;
-        if (!force && t == mAppliedT) return;
+        float r = volumeRatio();
+        float q = r < 0f ? -1f : Math.round(r * 20f) / 20f;
+        if (!force && q == mAppliedR) return;
+        float t = tailFactor(q);
 
         if (mDp != null) {
             float g = gainFor(t);
@@ -452,9 +474,9 @@ public class BassService extends Service {
             mDp.setLimiterAllChannelsTo(buildLimiter(t));
         }
         if (mLoudness != null) {
-            mLoudness.setTargetGain(loudnessFor(t));
+            mLoudness.setTargetGain(loudnessFor(q));
         }
-        mAppliedT = t;
+        mAppliedR = q;
     }
 
     private static int clamp(int v, int lo, int hi) {

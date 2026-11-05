@@ -28,6 +28,7 @@ public class Config extends SQLiteOpenHelper {
     public static final int DEFAULT_BASS_STRENGTH     = 1000; /* 0-1000 */
     public static final int DEFAULT_LOUDNESS_ENABLED  = 1;
     public static final int DEFAULT_LOUDNESS_TARGET   = 0;    /* millibel (mB), 0 = no gain, 600 = +6 dB */
+    public static final int DEFAULT_LOUDNESS_LOW      = 250;  /* mB, extra loudness at minimum volume, fades out by 50% */
     public static final int DEFAULT_DP_ENABLED        = 1;    /* Dynamics Processing low-band boost */
     public static final int DEFAULT_DP_GAIN           = 6;    /* dB, 0-15, bass gain up to mid volume */
     public static final int DEFAULT_DP_GAIN_MAX       = 4;    /* dB, 0-15, bass gain at max volume */
@@ -54,6 +55,7 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "bass_strength",    DEFAULT_BASS_STRENGTH);
         insert(db, "loudness_enabled", DEFAULT_LOUDNESS_ENABLED);
         insert(db, "loudness_target",  DEFAULT_LOUDNESS_TARGET);
+        insert(db, "loudness_low",     DEFAULT_LOUDNESS_LOW);
         insert(db, "dp_enabled",       DEFAULT_DP_ENABLED);
         insert(db, "dp_gain",          DEFAULT_DP_GAIN);
         insert(db, "dp_gain_max",      DEFAULT_DP_GAIN_MAX);
