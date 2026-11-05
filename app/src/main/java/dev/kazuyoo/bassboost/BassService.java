@@ -9,13 +9,17 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.media.AudioManager;
+import android.media.AudioPlaybackConfiguration;
 import android.media.audiofx.BassBoost;
 import android.media.audiofx.DynamicsProcessing;
 import android.media.audiofx.LoudnessEnhancer;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
+
+import java.util.List;
 
 public class BassService extends Service {
 
@@ -48,6 +52,11 @@ public class BassService extends Service {
      */
     private static final float KNEE = 0.5f;
 
+    /* While audio is playing the volume is also polled, because the platform volume
+     * broadcast is not delivered reliably on every ROM. */
+    private static final long POLL_MS   = 500;
+    private static final long ENSURE_MS = 5000;
+
     /* Pre-EQ band upper edges in Hz: 0-60 | 60-150 | 150-300 | 300+ */
     private static final float[] BAND_CUTOFF = { 60f, 150f, 300f, 20000f };
 
@@ -62,6 +71,28 @@ public class BassService extends Service {
     private boolean mReceiverRegistered = false;
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
+
+    private boolean mPolling    = false;
+    private long    mLastEnsure = 0;
+    private int     mVolMin     = -1;
+    private int     mVolMax     = -1;
+
+    private final Runnable mPoll = new Runnable() {
+        @Override
+        public void run() {
+            if (!mPolling) return;
+            onVolumeChanged();
+            mHandler.postDelayed(this, POLL_MS);
+        }
+    };
+
+    private final AudioManager.AudioPlaybackCallback mPlaybackCb =
+        new AudioManager.AudioPlaybackCallback() {
+            @Override
+            public void onPlaybackConfigChanged(List<AudioPlaybackConfiguration> configs) {
+                setPolling(configs != null && !configs.isEmpty());
+            }
+        };
 
     private final BroadcastReceiver mVolumeReceiver = new BroadcastReceiver() {
         @Override
@@ -89,6 +120,13 @@ public class BassService extends Service {
             mReceiverRegistered = true;
         } catch (Exception e) {
             Log.e(TAG, "volume receiver registration failed: " + e);
+        }
+
+        try {
+            mAudio.registerAudioPlaybackCallback(mPlaybackCb, mHandler);
+            setPolling(!mAudio.getActivePlaybackConfigurations().isEmpty());
+        } catch (Exception e) {
+            Log.e(TAG, "playback callback registration failed: " + e);
         }
 
         /* The audio server may not be ready right after boot; retry creating any
@@ -294,8 +332,19 @@ public class BassService extends Service {
     /* Volume-adaptive gain                                               */
     /* ------------------------------------------------------------------ */
 
+    private void setPolling(boolean on) {
+        if (on == mPolling) return;
+        mPolling = on;
+        mHandler.removeCallbacks(mPoll);
+        if (on) mHandler.post(mPoll);
+    }
+
     private void onVolumeChanged() {
-        ensureEffects();
+        long now = SystemClock.elapsedRealtime();
+        if (now - mLastEnsure >= ENSURE_MS) {
+            mLastEnsure = now;
+            ensureEffects();
+        }
         if (mConfig.get("adaptive", Config.DEFAULT_ADAPTIVE) != 1) return;
         try {
             applyAdaptive(false);
@@ -311,8 +360,12 @@ public class BassService extends Service {
     private float volumeFactor() {
         if (mConfig.get("adaptive", Config.DEFAULT_ADAPTIVE) != 1) return 0f;
         try {
-            int min = mAudio.getStreamMinVolume(AudioManager.STREAM_MUSIC);
-            int max = mAudio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            if (mVolMax < 0) {
+                mVolMin = mAudio.getStreamMinVolume(AudioManager.STREAM_MUSIC);
+                mVolMax = mAudio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            }
+            int min = mVolMin;
+            int max = mVolMax;
             if (max <= min) return 0f;
             float r = (mAudio.getStreamVolume(AudioManager.STREAM_MUSIC) - min) / (float) (max - min);
             r = Math.max(0f, Math.min(1f, r));
@@ -378,7 +431,9 @@ public class BassService extends Service {
 
     @Override
     public void onDestroy() {
+        mPolling = false;
         mHandler.removeCallbacksAndMessages(null);
+        try { mAudio.unregisterAudioPlaybackCallback(mPlaybackCb); } catch (Exception ignored) {}
         if (mReceiverRegistered) {
             try { unregisterReceiver(mVolumeReceiver); } catch (Exception ignored) {}
             mReceiverRegistered = false;
