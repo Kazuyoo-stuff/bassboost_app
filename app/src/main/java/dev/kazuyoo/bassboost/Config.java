@@ -13,9 +13,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Persistent settings. All values are loaded into memory once; reads never touch
- * the database. Writes go through a single background thread so the main thread
- * is never blocked by disk I/O.
+ * Persistent settings. Everything is loaded into memory once, so reads never touch the
+ * database. Writes go through one background thread so the main thread is never blocked
+ * by disk I/O. Keys unknown to this version (from newer builds) are simply ignored.
  */
 public class Config extends SQLiteOpenHelper {
 
@@ -24,16 +24,12 @@ public class Config extends SQLiteOpenHelper {
     private static final int    DB_VERSION = 1;
 
     /* default values */
-    public static final int DEFAULT_BASS_ENABLED      = 1;
-    public static final int DEFAULT_BASS_STRENGTH     = 1000; /* 0-1000 */
-    public static final int DEFAULT_LOUDNESS_ENABLED  = 1;
-    public static final int DEFAULT_LOUDNESS_TARGET   = 0;    /* millibel (mB), 0 = no gain, 600 = +6 dB */
-    public static final int DEFAULT_LOUDNESS_LOW      = 250;  /* mB, extra loudness at minimum volume, fades out by 50% */
-    public static final int DEFAULT_DP_ENABLED        = 1;    /* Dynamics Processing low-band boost */
-    public static final int DEFAULT_DP_GAIN           = 6;    /* dB, 0-15, bass gain up to mid volume */
-    public static final int DEFAULT_DP_GAIN_MAX       = 4;    /* dB, 0-15, bass gain at max volume */
-    public static final int DEFAULT_ADAPTIVE          = 1;    /* 1 = taper gain as volume rises */
-    public static final int DEFAULT_CLARITY           = 0;    /* 1 = multiband vocal/presence control */
+    public static final int DEFAULT_BASS_ENABLED     = 1;
+    public static final int DEFAULT_BASS_STRENGTH    = 1000; /* 0-1000 */
+    public static final int DEFAULT_LOUDNESS_ENABLED = 1;
+    public static final int DEFAULT_LOUDNESS_TARGET  = 0;    /* millibel (mB): 0 = no gain, 600 = +6 dB */
+    public static final int DEFAULT_DP_ENABLED       = 1;    /* Dynamics Processing low-band boost */
+    public static final int DEFAULT_DP_GAIN          = 6;    /* dB, 0-15 */
 
     private final Map<String, Integer> mCache = new ConcurrentHashMap<>();
     private final ExecutorService      mIo    = Executors.newSingleThreadExecutor();
@@ -55,12 +51,8 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "bass_strength",    DEFAULT_BASS_STRENGTH);
         insert(db, "loudness_enabled", DEFAULT_LOUDNESS_ENABLED);
         insert(db, "loudness_target",  DEFAULT_LOUDNESS_TARGET);
-        insert(db, "loudness_low",     DEFAULT_LOUDNESS_LOW);
         insert(db, "dp_enabled",       DEFAULT_DP_ENABLED);
         insert(db, "dp_gain",          DEFAULT_DP_GAIN);
-        insert(db, "dp_gain_max",      DEFAULT_DP_GAIN_MAX);
-        insert(db, "adaptive",         DEFAULT_ADAPTIVE);
-        insert(db, "clarity",          DEFAULT_CLARITY);
     }
 
     @Override
@@ -103,7 +95,7 @@ public class Config extends SQLiteOpenHelper {
                 ContentValues cv = new ContentValues();
                 cv.put("key", key);
                 cv.put("value", String.valueOf(value));
-                /* REPLACE so new keys are stored in databases created by older versions */
+                /* REPLACE so keys missing from databases created by older versions get stored */
                 db.insertWithOnConflict("settings", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
             } catch (Exception e) {
                 Log.e(TAG, "persist failed (" + key + "): " + e);

@@ -4,10 +4,7 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
-import android.content.BroadcastReceiver;
-import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.media.AudioManager;
 import android.media.AudioPlaybackConfiguration;
 import android.media.audiofx.BassBoost;
@@ -16,11 +13,17 @@ import android.media.audiofx.LoudnessEnhancer;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.os.SystemClock;
 import android.util.Log;
 
 import java.util.List;
 
+/**
+ * v1.1 sound, hardened.
+ *
+ * The signal path is exactly v1.1: Bass Boost, Loudness Enhancer and a Dynamics
+ * Processing stage (4-band pre-EQ plus limiter) on the global output mix. Nothing is
+ * volume-adaptive and nothing polls. What changed is how the effects are kept alive.
+ */
 public class BassService extends Service {
 
     private static final String TAG   = "BassService";
@@ -32,36 +35,11 @@ public class BassService extends Service {
     public static final String ACTION_SET_LOUDNESS_TARGET  = "dev.kazuyoo.bassboost.SET_LOUDNESS_TARGET";
     public static final String ACTION_SET_BASS_ENABLED     = "dev.kazuyoo.bassboost.SET_BASS_ENABLED";
     public static final String ACTION_SET_LOUDNESS_ENABLED = "dev.kazuyoo.bassboost.SET_LOUDNESS_ENABLED";
-    public static final String ACTION_SET_LOUDNESS_LOW     = "dev.kazuyoo.bassboost.SET_LOUDNESS_LOW";
     public static final String ACTION_SET_LOW_GAIN         = "dev.kazuyoo.bassboost.SET_LOW_GAIN";
-    public static final String ACTION_SET_HIGH_VOL_GAIN    = "dev.kazuyoo.bassboost.SET_HIGH_VOL_GAIN";
-    public static final String ACTION_SET_ADAPTIVE         = "dev.kazuyoo.bassboost.SET_ADAPTIVE";
-    public static final String ACTION_SET_CLARITY          = "dev.kazuyoo.bassboost.SET_CLARITY";
     public static final String ACTION_SET_DP_ENABLED       = "dev.kazuyoo.bassboost.SET_DP_ENABLED";
     public static final String EXTRA_VALUE                 = "value";
 
     private static final int NO_VALUE = Integer.MIN_VALUE;
-
-    /* Platform broadcasts (hidden constants in AudioManager) */
-    private static final String ACTION_VOLUME_CHANGED  = "android.media.VOLUME_CHANGED_ACTION";
-    private static final String ACTION_DEVICES_CHANGED = "android.media.STREAM_DEVICES_CHANGED_ACTION";
-    private static final String EXTRA_STREAM_TYPE      = "android.media.EXTRA_VOLUME_STREAM_TYPE";
-
-    /*
-     * Adaptive curve, r = music volume as a fraction of its range.
-     *  - r below KNEE: bass gain and limiter stay at the "quiet" values (same as v1.1),
-     *    while loudness gets an extra boost (loudness_low) that is largest at minimum
-     *    volume and fades to nothing at KNEE, compensating for the ear's weak low-volume
-     *    sensitivity.
-     *  - r above KNEE: factor t rises 0 -> 1 and bass gain, loudness and the limiter all
-     *    move towards their gentler "max volume" values.
-     */
-    private static final float KNEE = 0.5f;
-
-    /* While audio is playing the volume is also polled, because the platform volume
-     * broadcast is not delivered reliably on every ROM. */
-    private static final long POLL_MS   = 500;
-    private static final long ENSURE_MS = 5000;
 
     /* Pre-EQ band upper edges in Hz: 0-60 | 60-150 | 150-300 | 300+ */
     private static final float[] BAND_CUTOFF = { 60f, 150f, 300f, 20000f };
@@ -72,25 +50,12 @@ public class BassService extends Service {
     private Config             mConfig;
     private AudioManager       mAudio;
 
-    private float   mAppliedR = Float.NaN;
-    private boolean mReceiverRegistered = false;
-    private boolean mPlaying    = false;
-    private boolean mPolling    = false;
-    private long    mLastEnsure = 0;
-    private int     mVolMin     = -1;
-    private int     mVolMax     = -1;
+    private boolean mPlaying = false;
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
 
-    private final Runnable mPoll = new Runnable() {
-        @Override
-        public void run() {
-            if (!mPolling) return;
-            onVolumeChanged();
-            mHandler.postDelayed(this, POLL_MS);
-        }
-    };
-
+    /* Event-driven watchdog: whenever playback starts, make sure every effect is still
+     * alive and in the expected state. No timers, no polling. */
     private final AudioManager.AudioPlaybackCallback mPlaybackCb =
         new AudioManager.AudioPlaybackCallback() {
             @Override
@@ -98,20 +63,9 @@ public class BassService extends Service {
                 boolean playing = configs != null && !configs.isEmpty();
                 boolean started = playing && !mPlaying;
                 mPlaying = playing;
-                updatePolling();
-                if (started) ensureEffects();
+                if (started) verifyEffects();
             }
         };
-
-    private final BroadcastReceiver mVolumeReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (intent == null) return;
-            int type = intent.getIntExtra(EXTRA_STREAM_TYPE, AudioManager.STREAM_MUSIC);
-            if (type != AudioManager.STREAM_MUSIC) return;
-            onVolumeChanged();
-        }
-    };
 
     @Override
     public void onCreate() {
@@ -121,26 +75,13 @@ public class BassService extends Service {
         startFg();
         syncAll();
 
-        IntentFilter f = new IntentFilter();
-        f.addAction(ACTION_VOLUME_CHANGED);
-        f.addAction(ACTION_DEVICES_CHANGED);
-        try {
-            registerReceiver(mVolumeReceiver, f, Context.RECEIVER_NOT_EXPORTED);
-            mReceiverRegistered = true;
-        } catch (Exception e) {
-            Log.e(TAG, "volume receiver registration failed: " + e);
-        }
-
         try {
             mAudio.registerAudioPlaybackCallback(mPlaybackCb, mHandler);
-            mPlaying = !mAudio.getActivePlaybackConfigurations().isEmpty();
-            updatePolling();
         } catch (Exception e) {
             Log.e(TAG, "playback callback registration failed: " + e);
         }
 
-        /* The audio server may not be ready right after boot; retry creating any
-         * effect that failed, a couple of times. */
+        /* The audio server may not be ready right after boot: retry twice. */
         mHandler.postDelayed(this::ensureEffects, 5000);
         mHandler.postDelayed(this::ensureEffects, 30000);
     }
@@ -160,68 +101,46 @@ public class BassService extends Service {
 
     private void handleAction(String action, int value) {
         if (value == NO_VALUE) return;
-        try {
-            switch (action) {
-                case ACTION_SET_BASS_STRENGTH:
-                    mConfig.set("bass_strength", clamp(value, 0, 1000));
-                    syncBass();
-                    break;
-                case ACTION_SET_BASS_ENABLED:
-                    mConfig.set("bass_enabled", value == 1 ? 1 : 0);
-                    syncBass();
-                    break;
-                case ACTION_SET_LOUDNESS_TARGET:
-                    /* millibels: 0 = no gain, 600 = +6 dB */
-                    mConfig.set("loudness_target", clamp(value, 0, 2000));
-                    syncLoudness();
-                    break;
-                case ACTION_SET_LOUDNESS_LOW:
-                    /* millibels of extra loudness at minimum volume */
-                    mConfig.set("loudness_low", clamp(value, 0, 1000));
-                    syncLoudness();
-                    break;
-                case ACTION_SET_LOUDNESS_ENABLED:
-                    mConfig.set("loudness_enabled", value == 1 ? 1 : 0);
-                    syncLoudness();
-                    break;
-                case ACTION_SET_LOW_GAIN:
-                    mConfig.set("dp_gain", clamp(value, 0, 15));
-                    syncDp();
-                    break;
-                case ACTION_SET_HIGH_VOL_GAIN:
-                    mConfig.set("dp_gain_max", clamp(value, 0, 15));
-                    syncDp();
-                    break;
-                case ACTION_SET_ADAPTIVE:
-                    mConfig.set("adaptive", value == 1 ? 1 : 0);
-                    syncDp();
-                    syncLoudness();
-                    updatePolling();
-                    break;
-                case ACTION_SET_CLARITY:
-                    mConfig.set("clarity", value == 1 ? 1 : 0);
-                    releaseDp();   /* the effect is rebuilt with or without the multiband stage */
-                    syncDp();
-                    break;
-                case ACTION_SET_DP_ENABLED:
-                    mConfig.set("dp_enabled", value == 1 ? 1 : 0);
-                    syncDp();
-                    break;
-                default:
-                    return;
-            }
-            Log.i(TAG, action + "=" + value);
-        } catch (IllegalStateException | UnsupportedOperationException e) {
-            Log.e(TAG, "effect invalid (" + action + "), rebuilding: " + e);
-            recoverEffects();
-        } catch (Exception e) {
-            Log.e(TAG, "handleAction failed (" + action + "): " + e);
+        switch (action) {
+            case ACTION_SET_BASS_STRENGTH:
+                mConfig.set("bass_strength", clamp(value, 0, 1000));
+                syncBass();
+                break;
+            case ACTION_SET_BASS_ENABLED:
+                mConfig.set("bass_enabled", value == 1 ? 1 : 0);
+                syncBass();
+                break;
+            case ACTION_SET_LOUDNESS_TARGET:
+                /* millibels: 0 = no gain, 600 = +6 dB */
+                mConfig.set("loudness_target", clamp(value, 0, 2000));
+                syncLoudness();
+                break;
+            case ACTION_SET_LOUDNESS_ENABLED:
+                mConfig.set("loudness_enabled", value == 1 ? 1 : 0);
+                syncLoudness();
+                break;
+            case ACTION_SET_LOW_GAIN:
+                mConfig.set("dp_gain", clamp(value, 0, 15));
+                syncDp();
+                break;
+            case ACTION_SET_DP_ENABLED:
+                mConfig.set("dp_enabled", value == 1 ? 1 : 0);
+                syncDp();
+                break;
+            default:
+                return; /* unknown or newer action: ignore */
         }
+        Log.i(TAG, action + "=" + value);
     }
 
     /* ------------------------------------------------------------------ */
-    /* Effect lifecycle: an effect only exists while it is enabled, so a   */
-    /* disabled effect costs no CPU and does not sit in the output chain.  */
+    /* Effects                                                            */
+    /*                                                                    */
+    /* Each sync*() creates its effect if needed, then applies the stored  */
+    /* settings. If anything throws (a dead effect object after an audio   */
+    /* server restart, lost control, ...), the effect is released and      */
+    /* rebuilt once from scratch. A failure of one effect never affects    */
+    /* the others.                                                        */
     /* ------------------------------------------------------------------ */
 
     private void syncAll() {
@@ -231,102 +150,74 @@ public class BassService extends Service {
     }
 
     private void syncBass() {
-        try {
-            if (mConfig.get("bass_enabled", Config.DEFAULT_BASS_ENABLED) != 1) {
-                releaseBass();
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (mBass == null) mBass = new BassBoost(Integer.MAX_VALUE, 0); /* session 0 = global mix */
+                mBass.setStrength((short) clamp(mConfig.get("bass_strength", Config.DEFAULT_BASS_STRENGTH), 0, 1000));
+                mBass.setEnabled(mConfig.get("bass_enabled", Config.DEFAULT_BASS_ENABLED) == 1);
                 return;
+            } catch (Exception e) {
+                Log.e(TAG, "BassBoost failed (attempt " + (attempt + 1) + "): " + e);
+                releaseBass();
             }
-            if (mBass == null) mBass = new BassBoost(Integer.MAX_VALUE, 0); /* session 0 = global mix */
-            int strength = clamp(mConfig.get("bass_strength", Config.DEFAULT_BASS_STRENGTH), 0, 1000);
-            mBass.setStrength((short) strength);
-            mBass.setEnabled(true);
-        } catch (Exception e) {
-            Log.e(TAG, "BassBoost failed: " + e);
-            releaseBass();
         }
     }
 
     private void syncLoudness() {
-        try {
-            if (mConfig.get("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED) != 1) {
-                releaseLoudness();
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (mLoudness == null) mLoudness = new LoudnessEnhancer(0);
+                mLoudness.setTargetGain(clamp(mConfig.get("loudness_target", Config.DEFAULT_LOUDNESS_TARGET), 0, 2000));
+                mLoudness.setEnabled(mConfig.get("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED) == 1);
                 return;
+            } catch (Exception e) {
+                Log.e(TAG, "LoudnessEnhancer failed (attempt " + (attempt + 1) + "): " + e);
+                releaseLoudness();
             }
-            if (mLoudness == null) mLoudness = new LoudnessEnhancer(0);
-            mLoudness.setEnabled(true);
-            applyAdaptive(true);
-        } catch (Exception e) {
-            Log.e(TAG, "LoudnessEnhancer failed: " + e);
-            releaseLoudness();
         }
     }
 
     private void syncDp() {
-        try {
-            if (mConfig.get("dp_enabled", Config.DEFAULT_DP_ENABLED) != 1) {
-                releaseDp();
-                return;
-            }
-            if (mDp == null) createDp();
-            mDp.setEnabled(true);
-            applyAdaptive(true);
-        } catch (Exception e) {
-            Log.e(TAG, "DynamicsProcessing failed: " + e);
-            releaseDp();
-        }
-    }
-
-    /** Builds the Dynamics Processing effect, with the multiband stage if "clarity" is on. */
-    private void createDp() {
-        if (mConfig.get("clarity", Config.DEFAULT_CLARITY) == 1) {
+        for (int attempt = 0; attempt < 2; attempt++) {
             try {
-                mDp = buildDp(true);
+                if (mDp == null) mDp = buildDp();
+                applyLowGain(mDp, clamp(mConfig.get("dp_gain", Config.DEFAULT_DP_GAIN), 0, 15));
+                mDp.setEnabled(mConfig.get("dp_enabled", Config.DEFAULT_DP_ENABLED) == 1);
                 return;
             } catch (Exception e) {
-                Log.e(TAG, "multiband stage unavailable, falling back: " + e);
+                Log.e(TAG, "DynamicsProcessing failed (attempt " + (attempt + 1) + "): " + e);
+                releaseDp();
             }
         }
-        mDp = buildDp(false);
     }
 
-    private DynamicsProcessing buildDp(boolean withMbc) {
+    /** Dynamics Processing with a 4-band pre-EQ and a limiter, identical to v1.1. */
+    private DynamicsProcessing buildDp() {
         DynamicsProcessing.Config.Builder b = new DynamicsProcessing.Config.Builder(
             DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-            2,                          /* channels (stereo) */
-            true, 4,                    /* pre-EQ: 4 bands */
-            withMbc, withMbc ? 3 : 0,   /* multiband compressor: 3 bands, optional */
-            false, 0,                   /* post-EQ unused */
-            true);                      /* limiter */
+            2,          /* channels (stereo) */
+            true, 4,    /* pre-EQ: 4 bands */
+            false, 0,   /* MBC unused */
+            false, 0,   /* post-EQ unused */
+            true);      /* limiter */
 
         DynamicsProcessing dp = new DynamicsProcessing(Integer.MAX_VALUE, 0, b.build());
         try {
-            /* flat pre-EQ and quiet-volume limiter; applyAdaptive() sets the real values */
+            /* Both channels share link group 0, so the limiter reacts to the louder one
+             * and the stereo image stays put. */
+            dp.setLimiterAllChannelsTo(new DynamicsProcessing.Limiter(
+                true, true, 0,
+                1f,     /* attack ms     */
+                80f,    /* release ms    */
+                20f,    /* ratio         */
+                -3f,    /* threshold dB  */
+                0f));   /* post gain dB (applied after limiting) */
+
             DynamicsProcessing.Eq eq = new DynamicsProcessing.Eq(true, true, 4);
             for (int i = 0; i < 4; i++) {
                 eq.setBand(i, new DynamicsProcessing.EqBand(true, BAND_CUTOFF[i], 0f));
             }
             dp.setPreEqAllChannelsTo(eq);
-            dp.setLimiterAllChannelsTo(buildLimiter(0f));
-
-            if (withMbc) {
-                /*
-                 * "Clarity": per-band dynamics, so bass stays big but controlled while
-                 * vocals stay present and harsh highs are tamed.
-                 * band: upper edge, attack ms, release ms, ratio, threshold dB, knee dB,
-                 *       noise gate dB (off), expander ratio (off), pre gain, post gain
-                 */
-                DynamicsProcessing.Mbc mbc = new DynamicsProcessing.Mbc(true, true, 3);
-                /* bass  (<300 Hz): compress dents so bass is big but never huge */
-                mbc.setBand(0, new DynamicsProcessing.MbcBand(
-                    true,  300f, 15f, 150f, 2.5f, -12f, 6f, -90f, 1f, 0f, 0f));
-                /* vocal (300-2500 Hz): gentle levelling plus a small lift */
-                mbc.setBand(1, new DynamicsProcessing.MbcBand(
-                    true, 2500f, 10f, 120f, 2.0f, -28f, 6f, -90f, 1f, 0f, 2f));
-                /* presence (2.5 kHz+): only squash peaks that get harsh */
-                mbc.setBand(2, new DynamicsProcessing.MbcBand(
-                    true, 20000f, 5f, 80f, 3.0f, -22f, 6f, -90f, 1f, 0f, 0f));
-                dp.setMbcAllChannelsTo(mbc);
-            }
         } catch (RuntimeException e) {
             try { dp.release(); } catch (Exception ignored) {}
             throw e;
@@ -334,15 +225,14 @@ public class BassService extends Service {
         return dp;
     }
 
-    /** t = 0: the v1.1 limiter (hard, loud). t = 1: softer limiter for high volume. */
-    private static DynamicsProcessing.Limiter buildLimiter(float t) {
-        return new DynamicsProcessing.Limiter(
-            true, true, 0,
-            1f + 2f * t,        /* attack ms:    1 -> 3    */
-            80f + 40f * t,      /* release ms:  80 -> 120  */
-            20f - 10f * t,      /* ratio:       20 -> 10   */
-            -3f - t,            /* threshold dB: -3 -> -4  */
-            0f);                /* post gain dB            */
+    /**
+     * Stage parameters can be changed while the effect runs, so only the two boosted
+     * bands are touched instead of rebuilding the effect.
+     *   0-60 Hz: untouched | 60-150 Hz: full gain | 150-300 Hz: 60% | 300 Hz+: untouched
+     */
+    private void applyLowGain(DynamicsProcessing dp, int gainDb) {
+        dp.setPreEqBandAllChannelsTo(1, new DynamicsProcessing.EqBand(true, BAND_CUTOFF[1], gainDb));
+        dp.setPreEqBandAllChannelsTo(2, new DynamicsProcessing.EqBand(true, BAND_CUTOFF[2], gainDb * 0.6f));
     }
 
     private void releaseBass() {
@@ -357,7 +247,6 @@ public class BassService extends Service {
             try { mLoudness.release(); } catch (Exception ignored) {}
             mLoudness = null;
         }
-        mAppliedR = Float.NaN;
     }
 
     private void releaseDp() {
@@ -365,118 +254,41 @@ public class BassService extends Service {
             try { mDp.release(); } catch (Exception ignored) {}
             mDp = null;
         }
-        mAppliedR = Float.NaN;
     }
 
-    /** Re-creates any effect that should exist but does not (e.g. it failed during boot). */
+    /** Creates whichever effect is missing (e.g. it failed while booting). */
     private void ensureEffects() {
-        if (mConfig.get("dp_enabled", Config.DEFAULT_DP_ENABLED) == 1 && mDp == null) syncDp();
-        if (mConfig.get("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED) == 1 && mLoudness == null) syncLoudness();
-        if (mConfig.get("bass_enabled", Config.DEFAULT_BASS_ENABLED) == 1 && mBass == null) syncBass();
-    }
-
-    /** Called when an effect object turns out to be dead (e.g. audio server restarted). */
-    private void recoverEffects() {
-        releaseBass();
-        releaseLoudness();
-        releaseDp();
-        syncAll();
-    }
-
-    /* ------------------------------------------------------------------ */
-    /* Volume-adaptive behaviour                                          */
-    /* ------------------------------------------------------------------ */
-
-    private void updatePolling() {
-        setPolling(mPlaying && mConfig.get("adaptive", Config.DEFAULT_ADAPTIVE) == 1);
-    }
-
-    private void setPolling(boolean on) {
-        if (on == mPolling) return;
-        mPolling = on;
-        mHandler.removeCallbacks(mPoll);
-        if (on) mHandler.post(mPoll);
-    }
-
-    private void onVolumeChanged() {
-        long now = SystemClock.elapsedRealtime();
-        if (now - mLastEnsure >= ENSURE_MS) {
-            mLastEnsure = now;
-            ensureEffects();
-        }
-        if (mConfig.get("adaptive", Config.DEFAULT_ADAPTIVE) != 1) return;
-        try {
-            applyAdaptive(false);
-        } catch (IllegalStateException | UnsupportedOperationException e) {
-            Log.e(TAG, "effect invalid on volume change, rebuilding: " + e);
-            recoverEffects();
-        } catch (Exception e) {
-            Log.e(TAG, "adaptive update failed: " + e);
-        }
-    }
-
-    /** Music volume as 0..1, or -1 when adaptive mode is off or the volume cannot be read. */
-    private float volumeRatio() {
-        if (mConfig.get("adaptive", Config.DEFAULT_ADAPTIVE) != 1) return -1f;
-        try {
-            if (mVolMax < 0) {
-                mVolMin = mAudio.getStreamMinVolume(AudioManager.STREAM_MUSIC);
-                mVolMax = mAudio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-            }
-            int min = mVolMin;
-            int max = mVolMax;
-            if (max <= min) return -1f;
-            float r = (mAudio.getStreamVolume(AudioManager.STREAM_MUSIC) - min) / (float) (max - min);
-            return Math.max(0f, Math.min(1f, r));
-        } catch (Exception e) {
-            return -1f;
-        }
-    }
-
-    /** 0 up to KNEE, rising linearly to 1 at maximum volume. */
-    private static float tailFactor(float r) {
-        return r <= KNEE ? 0f : (r - KNEE) / (1f - KNEE);
-    }
-
-    /** 1 at minimum volume, fading to 0 at KNEE (0 when adaptive mode is off). */
-    private static float lowFactor(float r) {
-        return (r < 0f || r >= KNEE) ? 0f : 1f - r / KNEE;
-    }
-
-    private float gainFor(float t) {
-        float low  = clamp(mConfig.get("dp_gain",     Config.DEFAULT_DP_GAIN),     0, 15);
-        float high = clamp(mConfig.get("dp_gain_max", Config.DEFAULT_DP_GAIN_MAX), 0, 15);
-        float g = low + (high - low) * t;
-        return Math.round(g * 2f) / 2f; /* 0.5 dB steps */
-    }
-
-    private int loudnessFor(float r) {
-        int base  = clamp(mConfig.get("loudness_target", Config.DEFAULT_LOUDNESS_TARGET), 0, 2000);
-        int extra = clamp(mConfig.get("loudness_low",    Config.DEFAULT_LOUDNESS_LOW),    0, 1000);
-        float mb = (base + extra * lowFactor(r)) * (1f - tailFactor(r));
-        return Math.round(mb / 10f) * 10; /* 10 mB steps */
+        if (mBass == null)     syncBass();
+        if (mLoudness == null) syncLoudness();
+        if (mDp == null)       syncDp();
     }
 
     /**
-     * Pushes every volume-dependent value (bass gain, limiter, loudness) to the effects.
-     * The volume is quantised to 5% steps so nothing is touched unless it really changed.
+     * Cheap liveness probe, run when playback starts: re-asserting the enabled state
+     * throws if the effect object is dead, in which case the effect is rebuilt.
      */
-    private void applyAdaptive(boolean force) {
-        float r = volumeRatio();
-        float q = r < 0f ? -1f : Math.round(r * 20f) / 20f;
-        if (!force && q == mAppliedR) return;
-        float t = tailFactor(q);
-
-        if (mDp != null) {
-            float g = gainFor(t);
-            mDp.setPreEqBandAllChannelsTo(1, new DynamicsProcessing.EqBand(true, BAND_CUTOFF[1], g));
-            mDp.setPreEqBandAllChannelsTo(2, new DynamicsProcessing.EqBand(true, BAND_CUTOFF[2], g * 0.6f));
-            mDp.setLimiterAllChannelsTo(buildLimiter(t));
+    private void verifyEffects() {
+        try {
+            if (mBass == null) syncBass();
+            else mBass.setEnabled(mConfig.get("bass_enabled", Config.DEFAULT_BASS_ENABLED) == 1);
+        } catch (Exception e) {
+            releaseBass();
+            syncBass();
         }
-        if (mLoudness != null) {
-            mLoudness.setTargetGain(loudnessFor(q));
+        try {
+            if (mLoudness == null) syncLoudness();
+            else mLoudness.setEnabled(mConfig.get("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED) == 1);
+        } catch (Exception e) {
+            releaseLoudness();
+            syncLoudness();
         }
-        mAppliedR = q;
+        try {
+            if (mDp == null) syncDp();
+            else mDp.setEnabled(mConfig.get("dp_enabled", Config.DEFAULT_DP_ENABLED) == 1);
+        } catch (Exception e) {
+            releaseDp();
+            syncDp();
+        }
     }
 
     private static int clamp(int v, int lo, int hi) {
@@ -504,13 +316,8 @@ public class BassService extends Service {
 
     @Override
     public void onDestroy() {
-        mPolling = false;
         mHandler.removeCallbacksAndMessages(null);
         try { mAudio.unregisterAudioPlaybackCallback(mPlaybackCb); } catch (Exception ignored) {}
-        if (mReceiverRegistered) {
-            try { unregisterReceiver(mVolumeReceiver); } catch (Exception ignored) {}
-            mReceiverRegistered = false;
-        }
         releaseBass();
         releaseLoudness();
         releaseDp();
