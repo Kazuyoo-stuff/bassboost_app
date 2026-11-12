@@ -15,7 +15,7 @@ import java.util.concurrent.Executors;
 /**
  * Persistent settings. Everything is loaded into memory once, so reads never touch the
  * database. Writes go through one background thread so the main thread is never blocked
- * by disk I/O. Keys unknown to this version (from newer builds) are simply ignored.
+ * by disk I/O. Keys unknown to this version are simply ignored.
  */
 public class Config extends SQLiteOpenHelper {
 
@@ -30,6 +30,12 @@ public class Config extends SQLiteOpenHelper {
     public static final int DEFAULT_LOUDNESS_TARGET  = 0;    /* millibel (mB): 0 = no gain, 600 = +6 dB */
     public static final int DEFAULT_DP_ENABLED       = 1;    /* Dynamics Processing low-band boost */
     public static final int DEFAULT_DP_GAIN          = 6;    /* dB, 0-15 */
+
+    /* New in v1.2. All three are inactive at their defaults, so an upgrade sounds exactly like v1.1.1. */
+    public static final int DEFAULT_ADAPTIVE         = 0;    /* 1 = adapt to music volume */
+    public static final int DEFAULT_DP_GAIN_MAX      = 6;    /* dB, bass gain at maximum volume (adaptive only) */
+    public static final int DEFAULT_LOUDNESS_LOW     = 250;  /* mB, extra loudness at minimum volume (adaptive only) */
+    public static final int DEFAULT_VOCAL_SMOOTH     = 0;    /* dB cut at 2-6 kHz, 0 = off */
 
     private final Map<String, Integer> mCache = new ConcurrentHashMap<>();
     private final ExecutorService      mIo    = Executors.newSingleThreadExecutor();
@@ -53,6 +59,10 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "loudness_target",  DEFAULT_LOUDNESS_TARGET);
         insert(db, "dp_enabled",       DEFAULT_DP_ENABLED);
         insert(db, "dp_gain",          DEFAULT_DP_GAIN);
+        insert(db, "adaptive",         DEFAULT_ADAPTIVE);
+        insert(db, "dp_gain_max",      DEFAULT_DP_GAIN_MAX);
+        insert(db, "loudness_low",     DEFAULT_LOUDNESS_LOW);
+        insert(db, "vocal_smooth",     DEFAULT_VOCAL_SMOOTH);
     }
 
     @Override
