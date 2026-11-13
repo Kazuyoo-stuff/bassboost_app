@@ -45,6 +45,8 @@ public class BassService extends Service {
     public static final String ACTION_SET_HIGH_VOL_GAIN    = "dev.kazuyoo.bassboost.SET_HIGH_VOL_GAIN";
     public static final String ACTION_SET_LOUDNESS_LOW     = "dev.kazuyoo.bassboost.SET_LOUDNESS_LOW";
     public static final String ACTION_SET_VOCAL_SMOOTH     = "dev.kazuyoo.bassboost.SET_VOCAL_SMOOTH";
+    public static final String ACTION_SET_BASS_DEPTH       = "dev.kazuyoo.bassboost.SET_BASS_DEPTH";
+    public static final String ACTION_SET_LIMITER_RELEASE  = "dev.kazuyoo.bassboost.SET_LIMITER_RELEASE";
     public static final String EXTRA_VALUE                 = "value";
 
     private static final int NO_VALUE = Integer.MIN_VALUE;
@@ -203,6 +205,14 @@ public class BassService extends Service {
                 mConfig.set("vocal_smooth", clamp(value, 0, 6));
                 syncDp();
                 break;
+            case ACTION_SET_BASS_DEPTH:
+                mConfig.set("bass_depth", clamp(value, 0, 100));
+                syncDp();
+                break;
+            case ACTION_SET_LIMITER_RELEASE:
+                mConfig.set("limiter_release", clamp(value, 40, 400));
+                syncDp();
+                break;
             default:
                 return; /* unknown or newer action: ignore */
         }
@@ -311,11 +321,12 @@ public class BassService extends Service {
      * the stereo image stays put. t = 0 is the v1.1.1 limiter; t = 1 is the softer
      * high-volume limiter.
      */
-    private static DynamicsProcessing.Limiter buildLimiter(float t) {
+    private DynamicsProcessing.Limiter buildLimiter(float t) {
+        float release = clamp(mConfig.get("limiter_release", Config.DEFAULT_LIMITER_RELEASE), 40, 400);
         return new DynamicsProcessing.Limiter(
             true, true, 0,
-            1f + 2f * t,        /* attack ms:     1 -> 3     */
-            80f + 70f * t,      /* release ms:   80 -> 150   */
+            1f + 2f * t,        /* attack ms:     1 -> 3                    */
+            release + 70f * t,  /* release ms:    configured -> +70 ms      */
             20f - 12f * t,      /* ratio:        20 -> 8     */
             -3f - 1.5f * t,     /* threshold dB: -3 -> -4.5  */
             0f);                /* post gain dB (applied after limiting) */
@@ -324,12 +335,15 @@ public class BassService extends Service {
     /**
      * Stage parameters can be changed while the effect runs, so only the bands that move
      * are touched instead of rebuilding the effect.
-     *   60-150 Hz: full gain | 150-300 Hz: 60% | 2-6 kHz: -vocal_smooth (6-band mode only)
+     *   0-60 Hz: bass_depth % of the gain | 60-150 Hz: full gain | 150-300 Hz: 60%
+     *   2-6 kHz: -vocal_smooth (6-band mode only)
      */
     private void applyDp(DynamicsProcessing dp, float r) {
         float t = tailFactor(r);
         float g = gainFor(t);
         float[] cut = mDpBands == 6 ? CUT6 : CUT4;
+        float depth = clamp(mConfig.get("bass_depth", Config.DEFAULT_BASS_DEPTH), 0, 100) / 100f;
+        dp.setPreEqBandAllChannelsTo(0, new DynamicsProcessing.EqBand(true, cut[0], g * depth));
         dp.setPreEqBandAllChannelsTo(1, new DynamicsProcessing.EqBand(true, cut[1], g));
         dp.setPreEqBandAllChannelsTo(2, new DynamicsProcessing.EqBand(true, cut[2], g * 0.6f));
         if (mDpBands == 6) {

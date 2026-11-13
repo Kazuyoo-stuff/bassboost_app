@@ -37,6 +37,10 @@ public class Config extends SQLiteOpenHelper {
     public static final int DEFAULT_LOUDNESS_LOW     = 250;  /* mB, extra loudness at minimum volume (adaptive only) */
     public static final int DEFAULT_VOCAL_SMOOTH     = 0;    /* dB cut at 2-6 kHz, 0 = off */
 
+    /* New in v1.2.1. Defaults reproduce v1.2 exactly. */
+    public static final int DEFAULT_BASS_DEPTH       = 0;    /* %, share of the bass gain also applied below 60 Hz */
+    public static final int DEFAULT_LIMITER_RELEASE  = 80;   /* ms, limiter release at quiet volume */
+
     private final Map<String, Integer> mCache = new ConcurrentHashMap<>();
     private final ExecutorService      mIo    = Executors.newSingleThreadExecutor();
 
@@ -63,6 +67,8 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "dp_gain_max",      DEFAULT_DP_GAIN_MAX);
         insert(db, "loudness_low",     DEFAULT_LOUDNESS_LOW);
         insert(db, "vocal_smooth",     DEFAULT_VOCAL_SMOOTH);
+        insert(db, "bass_depth",       DEFAULT_BASS_DEPTH);
+        insert(db, "limiter_release",  DEFAULT_LIMITER_RELEASE);
     }
 
     @Override
