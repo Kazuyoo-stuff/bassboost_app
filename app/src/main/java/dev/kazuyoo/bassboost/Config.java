@@ -44,6 +44,9 @@ public class Config extends SQLiteOpenHelper {
     /* New in v1.3. Default reproduces v1.2.1 exactly. */
     public static final int DEFAULT_BASS_LOW         = 0;    /* dB, extra bass at minimum volume (adaptive only) */
 
+    /* New in v1.3.1. Default reproduces v1.3 exactly (150-300 Hz gets 60% of the bass gain). */
+    public static final int DEFAULT_BASS_BODY        = 60;   /* %, share of the bass gain applied at 150-300 Hz */
+
     private final Map<String, Integer> mCache = new ConcurrentHashMap<>();
     private final ExecutorService      mIo    = Executors.newSingleThreadExecutor();
 
@@ -73,6 +76,7 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "bass_depth",       DEFAULT_BASS_DEPTH);
         insert(db, "limiter_release",  DEFAULT_LIMITER_RELEASE);
         insert(db, "bass_low",         DEFAULT_BASS_LOW);
+        insert(db, "bass_body",        DEFAULT_BASS_BODY);
     }
 
     @Override

@@ -51,6 +51,7 @@ public class BassService extends Service {
     public static final String ACTION_SET_BASS_DEPTH       = "dev.kazuyoo.bassboost.SET_BASS_DEPTH";
     public static final String ACTION_SET_LIMITER_RELEASE  = "dev.kazuyoo.bassboost.SET_LIMITER_RELEASE";
     public static final String ACTION_SET_BASS_LOW         = "dev.kazuyoo.bassboost.SET_BASS_LOW";
+    public static final String ACTION_SET_BASS_BODY        = "dev.kazuyoo.bassboost.SET_BASS_BODY";
     public static final String EXTRA_VALUE                 = "value";
 
     private static final int NO_VALUE = Integer.MIN_VALUE;
@@ -217,6 +218,10 @@ public class BassService extends Service {
                 mConfig.set("limiter_release", clamp(value, 40, 400));
                 syncDp();
                 break;
+            case ACTION_SET_BASS_BODY:
+                mConfig.set("bass_body", clamp(value, 0, 100));
+                syncDp();
+                break;
             case ACTION_SET_BASS_LOW:
                 mConfig.set("bass_low", clamp(value, 0, 10));
                 syncDp();
@@ -343,7 +348,7 @@ public class BassService extends Service {
     /**
      * Stage parameters can be changed while the effect runs, so only the bands that move
      * are touched instead of rebuilding the effect.
-     *   0-60 Hz: bass_depth % of the gain | 60-150 Hz: full gain | 150-300 Hz: 60%
+     *   0-60 Hz: bass_depth % of the gain | 60-150 Hz: full gain | 150-300 Hz: bass_body %
      *   2-6 kHz: -vocal_smooth (6-band mode only)
      */
     private void applyDp(DynamicsProcessing dp, float r) {
@@ -353,7 +358,8 @@ public class BassService extends Service {
         float depth = clamp(mConfig.get("bass_depth", Config.DEFAULT_BASS_DEPTH), 0, 100) / 100f;
         dp.setPreEqBandAllChannelsTo(0, new DynamicsProcessing.EqBand(true, cut[0], g * depth));
         dp.setPreEqBandAllChannelsTo(1, new DynamicsProcessing.EqBand(true, cut[1], g));
-        dp.setPreEqBandAllChannelsTo(2, new DynamicsProcessing.EqBand(true, cut[2], g * 0.6f));
+        float body = clamp(mConfig.get("bass_body", Config.DEFAULT_BASS_BODY), 0, 100) / 100f;
+        dp.setPreEqBandAllChannelsTo(2, new DynamicsProcessing.EqBand(true, cut[2], g * body));
         if (mDpBands == 6) {
             float v = clamp(mConfig.get("vocal_smooth", Config.DEFAULT_VOCAL_SMOOTH), 0, 6);
             dp.setPreEqBandAllChannelsTo(4, new DynamicsProcessing.EqBand(true, cut[4], -v));
