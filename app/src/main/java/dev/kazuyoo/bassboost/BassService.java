@@ -27,6 +27,9 @@ import java.util.List;
  *                   upwards less bass drive, less loudness and a softer limiter, which
  *                   removes clipping and stuttering at high volume.
  *  - vocal_smooth:  a few dB of static EQ cut at 2-6 kHz against harsh, tinny vocals.
+ *  - bass_low:      equal-loudness compensation. The ear loses bass at low volume, so with
+ *                   adaptive on the bass gain is raised by up to bass_low dB at minimum
+ *                   volume, fading out by 60% volume.
  */
 public class BassService extends Service {
 
@@ -47,6 +50,7 @@ public class BassService extends Service {
     public static final String ACTION_SET_VOCAL_SMOOTH     = "dev.kazuyoo.bassboost.SET_VOCAL_SMOOTH";
     public static final String ACTION_SET_BASS_DEPTH       = "dev.kazuyoo.bassboost.SET_BASS_DEPTH";
     public static final String ACTION_SET_LIMITER_RELEASE  = "dev.kazuyoo.bassboost.SET_LIMITER_RELEASE";
+    public static final String ACTION_SET_BASS_LOW         = "dev.kazuyoo.bassboost.SET_BASS_LOW";
     public static final String EXTRA_VALUE                 = "value";
 
     private static final int NO_VALUE = Integer.MIN_VALUE;
@@ -213,6 +217,10 @@ public class BassService extends Service {
                 mConfig.set("limiter_release", clamp(value, 40, 400));
                 syncDp();
                 break;
+            case ACTION_SET_BASS_LOW:
+                mConfig.set("bass_low", clamp(value, 0, 10));
+                syncDp();
+                break;
             default:
                 return; /* unknown or newer action: ignore */
         }
@@ -340,7 +348,7 @@ public class BassService extends Service {
      */
     private void applyDp(DynamicsProcessing dp, float r) {
         float t = tailFactor(r);
-        float g = gainFor(t);
+        float g = gainFor(r);
         float[] cut = mDpBands == 6 ? CUT6 : CUT4;
         float depth = clamp(mConfig.get("bass_depth", Config.DEFAULT_BASS_DEPTH), 0, 100) / 100f;
         dp.setPreEqBandAllChannelsTo(0, new DynamicsProcessing.EqBand(true, cut[0], g * depth));
@@ -395,11 +403,18 @@ public class BassService extends Service {
         return (r < 0f || r >= KNEE) ? 0f : 1f - r / KNEE;
     }
 
-    private float gainFor(float t) {
-        float low  = clamp(mConfig.get("dp_gain",     Config.DEFAULT_DP_GAIN),     0, 15);
-        float high = clamp(mConfig.get("dp_gain_max", Config.DEFAULT_DP_GAIN_MAX), 0, 15);
-        high = Math.min(high, low); /* never boost more at high volume than at low volume */
-        return Math.round((low + (high - low) * t) * 2f) / 2f; /* 0.5 dB steps */
+    /**
+     * Bass gain in dB for music volume r (-1 = adaptive off):
+     *   below KNEE:  dp_gain plus up to bass_low dB, fading out towards KNEE
+     *   above KNEE:  slides from dp_gain down to dp_gain_max at maximum volume
+     */
+    private float gainFor(float r) {
+        float base  = clamp(mConfig.get("dp_gain",     Config.DEFAULT_DP_GAIN),     0, 15);
+        float high  = Math.min(clamp(mConfig.get("dp_gain_max", Config.DEFAULT_DP_GAIN_MAX), 0, 15), base);
+        float extra = clamp(mConfig.get("bass_low",    Config.DEFAULT_BASS_LOW),    0, 10);
+        float g = base + extra * lowFactor(r) + (high - base) * tailFactor(r);
+        g = Math.max(0f, Math.min(15f, g));
+        return Math.round(g * 2f) / 2f; /* 0.5 dB steps */
     }
 
     private int loudnessFor(float r) {
