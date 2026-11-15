@@ -6,6 +6,7 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:label="BassBoost"
@@ -23,9 +24,15 @@
             </intent-filter>
         </receiver>
 
+        <!--
+          Exported so "am startservice" works from adb without root. The DUMP permission is
+          held by the adb shell (and root) but not by normal apps, so other apps cannot
+          control the service.
+        -->
         <service
             android:name=".BassService"
-            android:exported="false"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
             android:foregroundServiceType="specialUse"
             android:persistent="true">
             <property

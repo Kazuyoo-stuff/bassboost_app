@@ -5,6 +5,8 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
 import android.media.AudioPlaybackConfiguration;
 import android.media.audiofx.AudioEffect;
@@ -27,6 +29,8 @@ import java.util.List;
  *                   upwards less bass drive, less loudness and a softer limiter, which
  *                   removes clipping and stuttering at high volume.
  *  - vocal_smooth:  a few dB of static EQ cut at 2-6 kHz against harsh, tinny vocals.
+ *  - speaker_only:  the effects are bypassed while headphones, Bluetooth or USB audio are
+ *                   connected, and come back when the built-in speaker is used again.
  *  - bass_low:      equal-loudness compensation. The ear loses bass at low volume, so with
  *                   adaptive on the bass gain is raised by up to bass_low dB at minimum
  *                   volume, fading out by 60% volume.
@@ -52,6 +56,7 @@ public class BassService extends Service {
     public static final String ACTION_SET_LIMITER_RELEASE  = "dev.kazuyoo.bassboost.SET_LIMITER_RELEASE";
     public static final String ACTION_SET_BASS_LOW         = "dev.kazuyoo.bassboost.SET_BASS_LOW";
     public static final String ACTION_SET_BASS_BODY        = "dev.kazuyoo.bassboost.SET_BASS_BODY";
+    public static final String ACTION_SET_SPEAKER_ONLY     = "dev.kazuyoo.bassboost.SET_SPEAKER_ONLY";
     public static final String EXTRA_VALUE                 = "value";
 
     private static final int NO_VALUE = Integer.MIN_VALUE;
@@ -80,6 +85,7 @@ public class BassService extends Service {
     private Config             mConfig;
     private AudioManager       mAudio;
 
+    private boolean mExternalOut = false;   /* headphones / Bluetooth / USB connected */
     private boolean mPlaying    = false;
     private boolean mPolling    = false;
     private float   mAppliedR   = Float.NaN;
@@ -113,7 +119,10 @@ public class BassService extends Service {
                 boolean started = playing && !mPlaying;
                 mPlaying = playing;
                 updatePolling();
-                if (started) verifyEffects();
+                if (started) {
+                    updateRoute();
+                    verifyEffects();
+                }
             }
         };
 
@@ -130,13 +139,36 @@ public class BassService extends Service {
             if (!enabled && shouldBeEnabled(effect)) scheduleVerify();
         };
 
+    /* Output devices come and go (Bluetooth connects, headphones plugged in). Routing is not
+     * always settled when the callback fires, so the check is repeated shortly afterwards. */
+    private final AudioDeviceCallback mDeviceCb = new AudioDeviceCallback() {
+        @Override
+        public void onAudioDevicesAdded(AudioDeviceInfo[] addedDevices) {
+            scheduleRouteCheck();
+        }
+
+        @Override
+        public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
+            scheduleRouteCheck();
+        }
+    };
+
+    private final Runnable mRouteCheck = this::updateRoute;
+
     @Override
     public void onCreate() {
         super.onCreate();
         mConfig = new Config(this);
         mAudio  = getSystemService(AudioManager.class);
+        mExternalOut = externalOutputConnected();
         startFg();
         syncAll();
+
+        try {
+            mAudio.registerAudioDeviceCallback(mDeviceCb, mHandler);
+        } catch (Exception e) {
+            Log.e(TAG, "device callback registration failed: " + e);
+        }
 
         try {
             mAudio.registerAudioPlaybackCallback(mPlaybackCb, mHandler);
@@ -218,6 +250,10 @@ public class BassService extends Service {
                 mConfig.set("limiter_release", clamp(value, 40, 400));
                 syncDp();
                 break;
+            case ACTION_SET_SPEAKER_ONLY:
+                mConfig.set("speaker_only", value == 1 ? 1 : 0);
+                syncAll();
+                break;
             case ACTION_SET_BASS_BODY:
                 mConfig.set("bass_body", clamp(value, 0, 100));
                 syncDp();
@@ -255,7 +291,7 @@ public class BassService extends Service {
                     watch(mBass);
                 }
                 mBass.setStrength((short) clamp(mConfig.get("bass_strength", Config.DEFAULT_BASS_STRENGTH), 0, 1000));
-                mBass.setEnabled(mConfig.get("bass_enabled", Config.DEFAULT_BASS_ENABLED) == 1);
+                mBass.setEnabled(enabledFor("bass_enabled", Config.DEFAULT_BASS_ENABLED));
                 return;
             } catch (Exception e) {
                 Log.e(TAG, "BassBoost failed (attempt " + (attempt + 1) + "): " + e);
@@ -272,7 +308,7 @@ public class BassService extends Service {
                     watch(mLoudness);
                 }
                 mLoudness.setTargetGain(loudnessFor(currentR()));
-                mLoudness.setEnabled(mConfig.get("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED) == 1);
+                mLoudness.setEnabled(enabledFor("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED));
                 return;
             } catch (Exception e) {
                 Log.e(TAG, "LoudnessEnhancer failed (attempt " + (attempt + 1) + "): " + e);
@@ -292,7 +328,7 @@ public class BassService extends Service {
                     watch(mDp);
                 }
                 applyDp(mDp, currentR());
-                mDp.setEnabled(mConfig.get("dp_enabled", Config.DEFAULT_DP_ENABLED) == 1);
+                mDp.setEnabled(enabledFor("dp_enabled", Config.DEFAULT_DP_ENABLED));
                 mAppliedR = currentR();
                 return;
             } catch (Exception e) {
@@ -450,10 +486,59 @@ public class BassService extends Service {
         } catch (Exception ignored) {}
     }
 
+    /** True when the setting is on and, in speaker-only mode, no external output is connected. */
+    private boolean enabledFor(String key, int def) {
+        if (mConfig.get(key, def) != 1) return false;
+        return !(mConfig.get("speaker_only", Config.DEFAULT_SPEAKER_ONLY) == 1 && mExternalOut);
+    }
+
+    /** True if headphones, Bluetooth, USB audio and similar outputs are connected. */
+    private boolean externalOutputConnected() {
+        try {
+            for (AudioDeviceInfo d : mAudio.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                switch (d.getType()) {
+                    case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP:
+                    case AudioDeviceInfo.TYPE_BLUETOOTH_SCO:
+                    case AudioDeviceInfo.TYPE_BLE_HEADSET:
+                    case AudioDeviceInfo.TYPE_BLE_SPEAKER:
+                    case AudioDeviceInfo.TYPE_WIRED_HEADPHONES:
+                    case AudioDeviceInfo.TYPE_WIRED_HEADSET:
+                    case AudioDeviceInfo.TYPE_USB_HEADSET:
+                    case AudioDeviceInfo.TYPE_USB_DEVICE:
+                    case AudioDeviceInfo.TYPE_HEARING_AID:
+                    case AudioDeviceInfo.TYPE_LINE_ANALOG:
+                    case AudioDeviceInfo.TYPE_LINE_DIGITAL:
+                    case AudioDeviceInfo.TYPE_HDMI:
+                        return true;
+                    default:
+                        break;
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "device query failed: " + e);
+        }
+        return false;
+    }
+
+    private void scheduleRouteCheck() {
+        mHandler.removeCallbacks(mRouteCheck);
+        mHandler.postDelayed(mRouteCheck, 300);
+        mHandler.postDelayed(mRouteCheck, 1500);
+    }
+
+    /** Re-evaluates the output route and switches the effects on or off if it changed. */
+    private void updateRoute() {
+        boolean ext = externalOutputConnected();
+        if (ext == mExternalOut) return;
+        mExternalOut = ext;
+        Log.i(TAG, "external output " + (ext ? "connected" : "disconnected"));
+        if (mConfig.get("speaker_only", Config.DEFAULT_SPEAKER_ONLY) == 1) syncAll();
+    }
+
     private boolean shouldBeEnabled(AudioEffect e) {
-        if (e == mBass)     return mConfig.get("bass_enabled", Config.DEFAULT_BASS_ENABLED) == 1;
-        if (e == mLoudness) return mConfig.get("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED) == 1;
-        if (e == mDp)       return mConfig.get("dp_enabled", Config.DEFAULT_DP_ENABLED) == 1;
+        if (e == mBass)     return enabledFor("bass_enabled", Config.DEFAULT_BASS_ENABLED);
+        if (e == mLoudness) return enabledFor("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED);
+        if (e == mDp)       return enabledFor("dp_enabled", Config.DEFAULT_DP_ENABLED);
         return false;
     }
 
@@ -499,21 +584,21 @@ public class BassService extends Service {
     private void verifyEffects() {
         try {
             if (mBass == null) syncBass();
-            else mBass.setEnabled(mConfig.get("bass_enabled", Config.DEFAULT_BASS_ENABLED) == 1);
+            else mBass.setEnabled(enabledFor("bass_enabled", Config.DEFAULT_BASS_ENABLED));
         } catch (Exception e) {
             releaseBass();
             syncBass();
         }
         try {
             if (mLoudness == null) syncLoudness();
-            else mLoudness.setEnabled(mConfig.get("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED) == 1);
+            else mLoudness.setEnabled(enabledFor("loudness_enabled", Config.DEFAULT_LOUDNESS_ENABLED));
         } catch (Exception e) {
             releaseLoudness();
             syncLoudness();
         }
         try {
             if (mDp == null) syncDp();
-            else mDp.setEnabled(mConfig.get("dp_enabled", Config.DEFAULT_DP_ENABLED) == 1);
+            else mDp.setEnabled(enabledFor("dp_enabled", Config.DEFAULT_DP_ENABLED));
         } catch (Exception e) {
             releaseDp();
             syncDp();
@@ -548,6 +633,7 @@ public class BassService extends Service {
         mPolling = false;
         mHandler.removeCallbacksAndMessages(null);
         try { mAudio.unregisterAudioPlaybackCallback(mPlaybackCb); } catch (Exception ignored) {}
+        try { mAudio.unregisterAudioDeviceCallback(mDeviceCb); } catch (Exception ignored) {}
         releaseBass();
         releaseLoudness();
         releaseDp();
