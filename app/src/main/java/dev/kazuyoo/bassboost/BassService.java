@@ -20,21 +20,6 @@ import android.util.Log;
 
 import java.util.List;
 
-/**
- * v1.2. The signal path is v1.1.1 (Bass Boost, Loudness Enhancer, Dynamics Processing
- * with a pre-EQ and a limiter on the global output mix). With the new options at their
- * defaults it sounds identical. Opt-in extras:
- *
- *  - adaptive:      follows the music volume. Louder at low volume, and from 60% volume
- *                   upwards less bass drive, less loudness and a softer limiter, which
- *                   removes clipping and stuttering at high volume.
- *  - vocal_smooth:  a few dB of static EQ cut at 2-6 kHz against harsh, tinny vocals.
- *  - speaker_only:  the effects are bypassed while headphones, Bluetooth or USB audio are
- *                   connected, and come back when the built-in speaker is used again.
- *  - bass_low:      equal-loudness compensation. The ear loses bass at low volume, so with
- *                   adaptive on the bass gain is raised by up to bass_low dB at minimum
- *                   volume, fading out by 60% volume.
- */
 public class BassService extends Service {
 
     private static final String TAG   = "BassService";
@@ -57,6 +42,9 @@ public class BassService extends Service {
     public static final String ACTION_SET_BASS_LOW         = "dev.kazuyoo.bassboost.SET_BASS_LOW";
     public static final String ACTION_SET_BASS_BODY        = "dev.kazuyoo.bassboost.SET_BASS_BODY";
     public static final String ACTION_SET_SPEAKER_ONLY     = "dev.kazuyoo.bassboost.SET_SPEAKER_ONLY";
+    public static final String ACTION_SET_TREBLE_CUT       = "dev.kazuyoo.bassboost.SET_TREBLE_CUT";
+    public static final String ACTION_SET_KNEE             = "dev.kazuyoo.bassboost.SET_KNEE";
+    public static final String ACTION_SET_PRESET           = "dev.kazuyoo.bassboost.SET_PRESET";
     public static final String EXTRA_VALUE                 = "value";
 
     private static final int NO_VALUE = Integer.MIN_VALUE;
@@ -69,7 +57,33 @@ public class BassService extends Service {
      *  - r above KNEE: factor t rises 0 -> 1. Bass gain slides to dp_gain_max, loudness
      *    to 0 and the limiter becomes softer.
      */
-    private static final float KNEE    = 0.6f;
+    /* The knee is configurable (SET_KNEE, percent of the music volume); see knee(). */
+
+    /*
+     * Presets: one command (SET_PRESET) sets everything. Individual commands still work
+     * afterwards and override single values. All presets 1-3 are tuned for the built-in
+     * speaker, so speaker_only is on.
+     *
+     *   0  off       effects disabled
+     *   1  soft      light boost, safest
+     *   2  balanced  strong, punchy bass that stays clean and tight at high volume
+     *   3  heavy     more bass; may stutter on weaker speakers at high volume
+     */
+    private static final int PRESET_DEFAULT = 2;
+
+    private static final String[] PRESET_KEYS = {
+        "bass_enabled", "loudness_enabled", "loudness_target", "dp_enabled",
+        "dp_gain", "bass_depth", "bass_body", "limiter_release",
+        "adaptive", "knee", "dp_gain_max", "bass_low",
+        "loudness_low", "vocal_smooth", "treble_cut", "speaker_only"
+    };
+
+    private static final int[][] PRESETS = {
+        /* 0 off      */ { 0, 0, 150, 0,   8,  0, 60, 200,  0, 60, 3, 0,   0, 0, 0, 1 },
+        /* 1 soft     */ { 0, 1, 150, 1,   8,  0, 50, 200,  1, 40, 3, 3, 200, 1, 2, 1 },
+        /* 2 balanced */ { 0, 1, 150, 1,  11,  0, 60, 200,  1, 40, 3, 4, 250, 2, 3, 1 },
+        /* 3 heavy    */ { 0, 1, 150, 1,  13, 10, 65, 200,  1, 45, 4, 5, 250, 2, 3, 1 },
+    };
     private static final long  POLL_MS = 500;
 
     /* Pre-EQ band upper edges in Hz.
@@ -161,6 +175,7 @@ public class BassService extends Service {
         mConfig = new Config(this);
         mAudio  = getSystemService(AudioManager.class);
         mExternalOut = externalOutputConnected();
+        if (mConfig.isFreshInstall()) storePreset(PRESET_DEFAULT); /* good sound with zero commands */
         startFg();
         syncAll();
 
@@ -250,6 +265,22 @@ public class BassService extends Service {
                 mConfig.set("limiter_release", clamp(value, 40, 400));
                 syncDp();
                 break;
+            case ACTION_SET_PRESET:
+                storePreset(clamp(value, 0, PRESETS.length - 1));
+                mAppliedR = Float.NaN;      /* force the next update */
+                syncAll();
+                updatePolling();
+                break;
+            case ACTION_SET_KNEE:
+                mConfig.set("knee", clamp(value, 20, 90));
+                mAppliedR = Float.NaN;      /* force the next update */
+                syncDp();
+                syncLoudness();
+                break;
+            case ACTION_SET_TREBLE_CUT:
+                mConfig.set("treble_cut", clamp(value, 0, 8));
+                syncDp();
+                break;
             case ACTION_SET_SPEAKER_ONLY:
                 mConfig.set("speaker_only", value == 1 ? 1 : 0);
                 syncAll();
@@ -318,7 +349,9 @@ public class BassService extends Service {
     }
 
     private void syncDp() {
-        int want = clamp(mConfig.get("vocal_smooth", Config.DEFAULT_VOCAL_SMOOTH), 0, 6) > 0 ? 6 : 4;
+        boolean shaping = clamp(mConfig.get("vocal_smooth", Config.DEFAULT_VOCAL_SMOOTH), 0, 6) > 0
+                       || clamp(mConfig.get("treble_cut",   Config.DEFAULT_TREBLE_CUT),   0, 8) > 0;
+        int want = shaping ? 6 : 4;
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
                 if (mDp != null && mDpBands != want) releaseDp(); /* band count is fixed at creation */
@@ -385,7 +418,7 @@ public class BassService extends Service {
      * Stage parameters can be changed while the effect runs, so only the bands that move
      * are touched instead of rebuilding the effect.
      *   0-60 Hz: bass_depth % of the gain | 60-150 Hz: full gain | 150-300 Hz: bass_body %
-     *   2-6 kHz: -vocal_smooth (6-band mode only)
+     *   2-6 kHz: -vocal_smooth | 6-20 kHz: -treble_cut (both 6-band mode only)
      */
     private void applyDp(DynamicsProcessing dp, float r) {
         float t = tailFactor(r);
@@ -399,6 +432,8 @@ public class BassService extends Service {
         if (mDpBands == 6) {
             float v = clamp(mConfig.get("vocal_smooth", Config.DEFAULT_VOCAL_SMOOTH), 0, 6);
             dp.setPreEqBandAllChannelsTo(4, new DynamicsProcessing.EqBand(true, cut[4], -v));
+            float tc = clamp(mConfig.get("treble_cut", Config.DEFAULT_TREBLE_CUT), 0, 8);
+            dp.setPreEqBandAllChannelsTo(5, new DynamicsProcessing.EqBand(true, cut[5], -tc));
         }
         dp.setLimiterAllChannelsTo(buildLimiter(t));
     }
@@ -435,14 +470,29 @@ public class BassService extends Service {
         }
     }
 
-    /** 0 up to KNEE, rising linearly to 1 at maximum volume. 0 when adaptive is off (r < 0). */
-    private static float tailFactor(float r) {
-        return r <= KNEE ? 0f : (r - KNEE) / (1f - KNEE);
+    /** Writes every value of a preset into the settings (the caller applies them). */
+    private void storePreset(int n) {
+        int[] values = PRESETS[n];
+        for (int i = 0; i < PRESET_KEYS.length; i++) {
+            mConfig.set(PRESET_KEYS[i], values[i]);
+        }
     }
 
-    /** 1 at minimum volume, fading to 0 at KNEE. 0 when adaptive is off (r < 0). */
-    private static float lowFactor(float r) {
-        return (r < 0f || r >= KNEE) ? 0f : 1f - r / KNEE;
+    /** Music volume (0..1) where the high-volume taper starts. */
+    private float knee() {
+        return clamp(mConfig.get("knee", Config.DEFAULT_KNEE), 20, 90) / 100f;
+    }
+
+    /** 0 up to the knee, rising linearly to 1 at maximum volume. 0 when adaptive is off (r < 0). */
+    private float tailFactor(float r) {
+        float k = knee();
+        return r <= k ? 0f : (r - k) / (1f - k);
+    }
+
+    /** 1 at minimum volume, fading to 0 at the knee. 0 when adaptive is off (r < 0). */
+    private float lowFactor(float r) {
+        float k = knee();
+        return (r < 0f || r >= k) ? 0f : 1f - r / k;
     }
 
     /**

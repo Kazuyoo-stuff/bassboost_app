@@ -50,6 +50,14 @@ public class Config extends SQLiteOpenHelper {
     /* New in v1.3.2. Default reproduces v1.3.1 exactly (effects apply to every output). */
     public static final int DEFAULT_SPEAKER_ONLY     = 0;    /* 1 = bypass all effects on headphones, Bluetooth, USB */
 
+    /* New in v1.3.3. Default reproduces v1.3.2 exactly. */
+    public static final int DEFAULT_TREBLE_CUT       = 0;    /* dB cut above 6 kHz (hiss, "cess cess"), 0 = off */
+
+    /* New in v1.3.4. Default reproduces v1.3.3 exactly. */
+    public static final int DEFAULT_KNEE             = 60;   /* %, music volume where the adaptive taper starts (20-90) */
+
+    private boolean mFresh = false; /* true when the database was created by this run */
+
     private final Map<String, Integer> mCache = new ConcurrentHashMap<>();
     private final ExecutorService      mIo    = Executors.newSingleThreadExecutor();
 
@@ -60,6 +68,7 @@ public class Config extends SQLiteOpenHelper {
 
     @Override
     public void onCreate(SQLiteDatabase db) {
+        mFresh = true;
         db.execSQL(
             "CREATE TABLE IF NOT EXISTS settings (" +
             "  key   TEXT PRIMARY KEY," +
@@ -81,6 +90,8 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "bass_low",         DEFAULT_BASS_LOW);
         insert(db, "bass_body",        DEFAULT_BASS_BODY);
         insert(db, "speaker_only",     DEFAULT_SPEAKER_ONLY);
+        insert(db, "treble_cut",       DEFAULT_TREBLE_CUT);
+        insert(db, "knee",             DEFAULT_KNEE);
     }
 
     @Override
@@ -106,6 +117,11 @@ public class Config extends SQLiteOpenHelper {
         } catch (Exception e) {
             Log.e(TAG, "load failed, using defaults: " + e);
         }
+    }
+
+    /** True on the very first run after a fresh install (not after an update). */
+    public boolean isFreshInstall() {
+        return mFresh;
     }
 
     /** Returns the stored value, or {@code def} if the key is missing. Never blocks on disk. */
