@@ -20,6 +20,23 @@ import android.util.Log;
 
 import java.util.List;
 
+/**
+ * v1.2. The signal path is v1.1.1 (Bass Boost, Loudness Enhancer, Dynamics Processing
+ * with a pre-EQ and a limiter on the global output mix). With the new options at their
+ * defaults it sounds identical. Opt-in extras:
+ *
+ *  - adaptive:      follows the music volume. Louder at low volume, and from 60% volume
+ *                   upwards less bass drive, less loudness and a softer limiter, which
+ *                   removes clipping and stuttering at high volume.
+ *  - vocal_smooth:  a few dB of static EQ cut at 2-6 kHz against harsh, tinny vocals.
+ *  - treble_cut:    a static shelf cut above 6 kHz against hiss and harsh "cess cess" highs,
+ *                   which also makes the bass feel stronger by comparison.
+ *  - speaker_only:  the effects are bypassed while headphones, Bluetooth or USB audio are
+ *                   connected, and come back when the built-in speaker is used again.
+ *  - bass_low:      equal-loudness compensation. The ear loses bass at low volume, so with
+ *                   adaptive on the bass gain is raised by up to bass_low dB at minimum
+ *                   volume, fading out by 60% volume.
+ */
 public class BassService extends Service {
 
     private static final String TAG   = "BassService";
@@ -45,6 +62,8 @@ public class BassService extends Service {
     public static final String ACTION_SET_TREBLE_CUT       = "dev.kazuyoo.bassboost.SET_TREBLE_CUT";
     public static final String ACTION_SET_KNEE             = "dev.kazuyoo.bassboost.SET_KNEE";
     public static final String ACTION_SET_PRESET           = "dev.kazuyoo.bassboost.SET_PRESET";
+    public static final String ACTION_SET_DTS_LOW          = "dev.kazuyoo.bassboost.SET_DTS_LOW";
+    public static final String ACTION_SET_DTS_MID          = "dev.kazuyoo.bassboost.SET_DTS_MID";
     public static final String EXTRA_VALUE                 = "value";
 
     private static final int NO_VALUE = Integer.MIN_VALUE;
@@ -68,6 +87,9 @@ public class BassService extends Service {
      *   1  soft      light boost, safest
      *   2  balanced  strong, punchy bass that stays clean and tight at high volume
      *   3  heavy     more bass; may stutter on weaker speakers at high volume
+     *   4  dts       balanced, tuned for a vendor EQ of 100 Hz +5, 300 Hz +5, 1K -5, 3K -5,
+     *                10K -4: a bass guard keeps the bass from clipping after the vendor EQ
+     *                adds its gain, and the mids it cuts are partly given back
      */
     private static final int PRESET_DEFAULT = 2;
 
@@ -75,14 +97,16 @@ public class BassService extends Service {
         "bass_enabled", "loudness_enabled", "loudness_target", "dp_enabled",
         "dp_gain", "bass_depth", "bass_body", "limiter_release",
         "adaptive", "knee", "dp_gain_max", "bass_low",
-        "loudness_low", "vocal_smooth", "treble_cut", "speaker_only"
+        "loudness_low", "vocal_smooth", "treble_cut", "speaker_only",
+        "dts_low", "dts_mid"
     };
 
     private static final int[][] PRESETS = {
-        /* 0 off      */ { 0, 0, 150, 0,   8,  0, 60, 200,  0, 60, 3, 0,   0, 0, 0, 1 },
-        /* 1 soft     */ { 0, 1, 150, 1,   8,  0, 50, 200,  1, 40, 3, 3, 200, 1, 2, 1 },
-        /* 2 balanced */ { 0, 1, 150, 1,  11,  0, 60, 200,  1, 40, 3, 4, 250, 2, 3, 1 },
-        /* 3 heavy    */ { 0, 1, 150, 1,  13, 10, 65, 200,  1, 45, 4, 5, 250, 2, 3, 1 },
+        /* 0 off      */ { 0, 0, 150, 0,   8,  0, 60, 200,  0, 60, 3, 0,   0, 0, 0, 1,  0, 0 },
+        /* 1 soft     */ { 0, 1, 150, 1,   8,  0, 50, 200,  1, 40, 3, 3, 200, 1, 2, 1,  0, 0 },
+        /* 2 balanced */ { 0, 1, 150, 1,  11,  0, 60, 200,  1, 40, 3, 4, 250, 2, 3, 1,  0, 0 },
+        /* 3 heavy    */ { 0, 1, 150, 1,  13, 10, 65, 200,  1, 45, 4, 5, 250, 2, 3, 1,  0, 0 },
+        /* 4 dts      */ { 0, 1, 150, 1,  10,  0, 60, 200,  1, 40, 3, 4, 250, 0, 2, 1,  5, 5 },
     };
     private static final long  POLL_MS = 500;
 
@@ -96,6 +120,7 @@ public class BassService extends Service {
     private LoudnessEnhancer   mLoudness;
     private DynamicsProcessing mDp;
     private int                mDpBands = 0;
+    private boolean            mDpMbc   = false;   /* DP was built with the bass guard */
     private Config             mConfig;
     private AudioManager       mAudio;
 
@@ -265,6 +290,15 @@ public class BassService extends Service {
                 mConfig.set("limiter_release", clamp(value, 40, 400));
                 syncDp();
                 break;
+            case ACTION_SET_DTS_LOW:
+                mConfig.set("dts_low", clamp(value, 0, 10));
+                releaseDp();                /* the bass guard threshold is fixed at creation */
+                syncDp();
+                break;
+            case ACTION_SET_DTS_MID:
+                mConfig.set("dts_mid", clamp(value, 0, 8));
+                syncDp();
+                break;
             case ACTION_SET_PRESET:
                 storePreset(clamp(value, 0, PRESETS.length - 1));
                 mAppliedR = Float.NaN;      /* force the next update */
@@ -350,13 +384,16 @@ public class BassService extends Service {
 
     private void syncDp() {
         boolean shaping = clamp(mConfig.get("vocal_smooth", Config.DEFAULT_VOCAL_SMOOTH), 0, 6) > 0
-                       || clamp(mConfig.get("treble_cut",   Config.DEFAULT_TREBLE_CUT),   0, 8) > 0;
+                       || clamp(mConfig.get("treble_cut",   Config.DEFAULT_TREBLE_CUT),   0, 8) > 0
+                       || clamp(mConfig.get("dts_mid",      Config.DEFAULT_DTS_MID),      0, 8) > 0;
         int want = shaping ? 6 : 4;
+        boolean wantMbc = clamp(mConfig.get("dts_low", Config.DEFAULT_DTS_LOW), 0, 10) > 0;
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
-                if (mDp != null && mDpBands != want) releaseDp(); /* band count is fixed at creation */
+                /* band count and the bass guard are fixed at creation */
+                if (mDp != null && (mDpBands != want || mDpMbc != wantMbc)) releaseDp();
                 if (mDp == null) {
-                    mDp = buildDp(want);
+                    mDp = createDp(want, wantMbc);
                     mDpBands = want;
                     watch(mDp);
                 }
@@ -371,15 +408,50 @@ public class BassService extends Service {
         }
     }
 
-    /** Dynamics Processing: flat pre-EQ with the given band count plus a limiter. */
-    private DynamicsProcessing buildDp(int bands) {
+    /** Builds the effect with the bass guard if requested; falls back to none if unsupported. */
+    private DynamicsProcessing createDp(int bands, boolean withMbc) {
+        if (withMbc) {
+            try {
+                DynamicsProcessing dp = buildDp(bands, true);
+                mDpMbc = true;
+                return dp;
+            } catch (Exception e) {
+                Log.e(TAG, "bass guard unavailable, continuing without it: " + e);
+            }
+        }
+        mDpMbc = false;
+        return buildDp(bands, false);
+    }
+
+    /**
+     * The vendor equalizer (DTS) runs after this effect and adds its own gain at 100-300 Hz,
+     * so bass peaks that look safe to the limiter here can clip afterwards, which sounds like
+     * stuttering at high volume. The guard is a fast compressor on 0-300 Hz only, with its
+     * threshold lowered by the vendor's boost (dts_low) plus a small margin, so the bass
+     * stays below full scale even after the vendor EQ. Highs and mids are left alone.
+     */
+    private DynamicsProcessing.Mbc buildBassGuard() {
+        float dtsLow = clamp(mConfig.get("dts_low", Config.DEFAULT_DTS_LOW), 0, 10);
+        float threshold = -(dtsLow + 1.5f);
+        DynamicsProcessing.Mbc mbc = new DynamicsProcessing.Mbc(true, true, 2);
+        /* band: enabled, upper edge Hz, attack ms, release ms, ratio, threshold dB, knee dB,
+         *       noise gate dB (off), expander ratio (off), pre gain, post gain */
+        mbc.setBand(0, new DynamicsProcessing.MbcBand(
+            true, 300f, 2f, 100f, 12f, threshold, 2f, -90f, 1f, 0f, 0f));
+        mbc.setBand(1, new DynamicsProcessing.MbcBand(
+            false, 20000f, 10f, 100f, 1f, 0f, 0f, -90f, 1f, 0f, 0f));
+        return mbc;
+    }
+
+    /** Dynamics Processing: flat pre-EQ with the given band count, optional bass guard, limiter. */
+    private DynamicsProcessing buildDp(int bands, boolean withMbc) {
         DynamicsProcessing.Config.Builder b = new DynamicsProcessing.Config.Builder(
             DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-            2,              /* channels (stereo) */
-            true, bands,    /* pre-EQ */
-            false, 0,       /* MBC unused */
-            false, 0,       /* post-EQ unused */
-            true);          /* limiter */
+            2,                          /* channels (stereo) */
+            true, bands,                /* pre-EQ */
+            withMbc, withMbc ? 2 : 0,   /* multiband compressor = bass guard */
+            false, 0,                   /* post-EQ unused */
+            true);                      /* limiter */
 
         DynamicsProcessing dp = new DynamicsProcessing(Integer.MAX_VALUE, 0, b.build());
         try {
@@ -391,6 +463,8 @@ public class BassService extends Service {
                 eq.setBand(i, new DynamicsProcessing.EqBand(true, cut[i], 0f));
             }
             dp.setPreEqAllChannelsTo(eq);
+
+            if (withMbc) dp.setMbcAllChannelsTo(buildBassGuard());
         } catch (RuntimeException e) {
             try { dp.release(); } catch (Exception ignored) {}
             throw e;
@@ -431,7 +505,10 @@ public class BassService extends Service {
         dp.setPreEqBandAllChannelsTo(2, new DynamicsProcessing.EqBand(true, cut[2], g * body));
         if (mDpBands == 6) {
             float v = clamp(mConfig.get("vocal_smooth", Config.DEFAULT_VOCAL_SMOOTH), 0, 6);
-            dp.setPreEqBandAllChannelsTo(4, new DynamicsProcessing.EqBand(true, cut[4], -v));
+            /* give back half of what the vendor EQ cuts at 1-3 kHz, so vocals do not sink */
+            float lift = clamp(mConfig.get("dts_mid", Config.DEFAULT_DTS_MID), 0, 8) * 0.5f;
+            dp.setPreEqBandAllChannelsTo(3, new DynamicsProcessing.EqBand(true, cut[3], lift));
+            dp.setPreEqBandAllChannelsTo(4, new DynamicsProcessing.EqBand(true, cut[4], lift - v));
             float tc = clamp(mConfig.get("treble_cut", Config.DEFAULT_TREBLE_CUT), 0, 8);
             dp.setPreEqBandAllChannelsTo(5, new DynamicsProcessing.EqBand(true, cut[5], -tc));
         }
@@ -617,6 +694,7 @@ public class BassService extends Service {
             mDp = null;
         }
         mDpBands = 0;
+        mDpMbc = false;
         mAppliedR = Float.NaN;
     }
 

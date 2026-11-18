@@ -56,6 +56,10 @@ public class Config extends SQLiteOpenHelper {
     /* New in v1.3.4. Default reproduces v1.3.3 exactly. */
     public static final int DEFAULT_KNEE             = 60;   /* %, music volume where the adaptive taper starts (20-90) */
 
+    /* New in v1.5: tell the app what the vendor equalizer (DTS) does after it. Defaults = off. */
+    public static final int DEFAULT_DTS_LOW          = 0;    /* dB the vendor EQ boosts at 100-300 Hz (0-10) */
+    public static final int DEFAULT_DTS_MID          = 0;    /* dB the vendor EQ cuts at 1-3 kHz (0-8) */
+
     private boolean mFresh = false; /* true when the database was created by this run */
 
     private final Map<String, Integer> mCache = new ConcurrentHashMap<>();
@@ -92,6 +96,8 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "speaker_only",     DEFAULT_SPEAKER_ONLY);
         insert(db, "treble_cut",       DEFAULT_TREBLE_CUT);
         insert(db, "knee",             DEFAULT_KNEE);
+        insert(db, "dts_low",          DEFAULT_DTS_LOW);
+        insert(db, "dts_mid",          DEFAULT_DTS_MID);
     }
 
     @Override
