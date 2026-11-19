@@ -31,6 +31,8 @@ import java.util.List;
  *  - vocal_smooth:  a few dB of static EQ cut at 2-6 kHz against harsh, tinny vocals.
  *  - treble_cut:    a static shelf cut above 6 kHz against hiss and harsh "cess cess" highs,
  *                   which also makes the bass feel stronger by comparison.
+ *  - tone_bass / tone_treble: simple tone knobs (-6..+6 dB) that follow the volume. A bass
+ *                   offset shrinks towards maximum volume, a treble boost fades out there.
  *  - speaker_only:  the effects are bypassed while headphones, Bluetooth or USB audio are
  *                   connected, and come back when the built-in speaker is used again.
  *  - bass_low:      equal-loudness compensation. The ear loses bass at low volume, so with
@@ -64,6 +66,8 @@ public class BassService extends Service {
     public static final String ACTION_SET_PRESET           = "dev.kazuyoo.bassboost.SET_PRESET";
     public static final String ACTION_SET_DTS_LOW          = "dev.kazuyoo.bassboost.SET_DTS_LOW";
     public static final String ACTION_SET_DTS_MID          = "dev.kazuyoo.bassboost.SET_DTS_MID";
+    public static final String ACTION_SET_TONE_BASS        = "dev.kazuyoo.bassboost.SET_TONE_BASS";
+    public static final String ACTION_SET_TONE_TREBLE      = "dev.kazuyoo.bassboost.SET_TONE_TREBLE";
     public static final String EXTRA_VALUE                 = "value";
 
     private static final int NO_VALUE = Integer.MIN_VALUE;
@@ -98,15 +102,15 @@ public class BassService extends Service {
         "dp_gain", "bass_depth", "bass_body", "limiter_release",
         "adaptive", "knee", "dp_gain_max", "bass_low",
         "loudness_low", "vocal_smooth", "treble_cut", "speaker_only",
-        "dts_low", "dts_mid"
+        "dts_low", "dts_mid", "tone_bass", "tone_treble"
     };
 
     private static final int[][] PRESETS = {
-        /* 0 off      */ { 0, 0, 150, 0,   8,  0, 60, 200,  0, 60, 3, 0,   0, 0, 0, 1,  0, 0 },
-        /* 1 soft     */ { 0, 1, 150, 1,   8,  0, 50, 200,  1, 40, 3, 3, 200, 1, 2, 1,  0, 0 },
-        /* 2 balanced */ { 0, 1, 150, 1,  11,  0, 60, 200,  1, 40, 3, 4, 250, 2, 3, 1,  0, 0 },
-        /* 3 heavy    */ { 0, 1, 150, 1,  13, 10, 65, 200,  1, 45, 4, 5, 250, 2, 3, 1,  0, 0 },
-        /* 4 dts      */ { 0, 1, 150, 1,  10,  0, 60, 200,  1, 40, 3, 4, 250, 0, 2, 1,  5, 5 },
+        /* 0 off      */ { 0, 0, 150, 0,   8,  0, 60, 200,  0, 60, 3, 0,   0, 0, 0, 1,  0, 0,  0, 0 },
+        /* 1 soft     */ { 0, 1, 150, 1,   8,  0, 50, 200,  1, 40, 3, 3, 200, 1, 2, 1,  0, 0,  0, 0 },
+        /* 2 balanced */ { 0, 1, 150, 1,  11,  0, 60, 200,  1, 40, 3, 4, 250, 2, 3, 1,  0, 0,  0, 0 },
+        /* 3 heavy    */ { 0, 1, 150, 1,  13, 10, 65, 200,  1, 45, 4, 5, 250, 2, 3, 1,  0, 0,  0, 0 },
+        /* 4 dts      */ { 0, 1, 150, 1,  10,  0, 60, 200,  1, 40, 3, 4, 250, 0, 2, 1,  5, 5,  0, 0 },
     };
     private static final long  POLL_MS = 500;
 
@@ -290,6 +294,14 @@ public class BassService extends Service {
                 mConfig.set("limiter_release", clamp(value, 40, 400));
                 syncDp();
                 break;
+            case ACTION_SET_TONE_BASS:
+                mConfig.set("tone_bass", clamp(value, -6, 6));
+                syncDp();
+                break;
+            case ACTION_SET_TONE_TREBLE:
+                mConfig.set("tone_treble", clamp(value, -6, 6));
+                syncDp();
+                break;
             case ACTION_SET_DTS_LOW:
                 mConfig.set("dts_low", clamp(value, 0, 10));
                 releaseDp();                /* the bass guard threshold is fixed at creation */
@@ -385,7 +397,8 @@ public class BassService extends Service {
     private void syncDp() {
         boolean shaping = clamp(mConfig.get("vocal_smooth", Config.DEFAULT_VOCAL_SMOOTH), 0, 6) > 0
                        || clamp(mConfig.get("treble_cut",   Config.DEFAULT_TREBLE_CUT),   0, 8) > 0
-                       || clamp(mConfig.get("dts_mid",      Config.DEFAULT_DTS_MID),      0, 8) > 0;
+                       || clamp(mConfig.get("dts_mid",      Config.DEFAULT_DTS_MID),      0, 8) > 0
+                       || clamp(mConfig.get("tone_treble",  Config.DEFAULT_TONE_TREBLE), -6, 6) != 0;
         int want = shaping ? 6 : 4;
         boolean wantMbc = clamp(mConfig.get("dts_low", Config.DEFAULT_DTS_LOW), 0, 10) > 0;
         for (int attempt = 0; attempt < 2; attempt++) {
@@ -508,9 +521,14 @@ public class BassService extends Service {
             /* give back half of what the vendor EQ cuts at 1-3 kHz, so vocals do not sink */
             float lift = clamp(mConfig.get("dts_mid", Config.DEFAULT_DTS_MID), 0, 8) * 0.5f;
             dp.setPreEqBandAllChannelsTo(3, new DynamicsProcessing.EqBand(true, cut[3], lift));
-            dp.setPreEqBandAllChannelsTo(4, new DynamicsProcessing.EqBand(true, cut[4], lift - v));
+            /* Treble tone: a boost applies in full up to the knee and fades to nothing at maximum
+             * volume (highs get harsh when loud); a cut stays in force at every volume.
+             * 6-20 kHz gets the full offset, 2-6 kHz half of it. */
+            float tt = clamp(mConfig.get("tone_treble", Config.DEFAULT_TONE_TREBLE), -6, 6);
+            if (tt > 0f) tt *= (1f - t);
+            dp.setPreEqBandAllChannelsTo(4, new DynamicsProcessing.EqBand(true, cut[4], lift - v + tt * 0.5f));
             float tc = clamp(mConfig.get("treble_cut", Config.DEFAULT_TREBLE_CUT), 0, 8);
-            dp.setPreEqBandAllChannelsTo(5, new DynamicsProcessing.EqBand(true, cut[5], -tc));
+            dp.setPreEqBandAllChannelsTo(5, new DynamicsProcessing.EqBand(true, cut[5], -tc + tt));
         }
         dp.setLimiterAllChannelsTo(buildLimiter(t));
     }
@@ -582,6 +600,10 @@ public class BassService extends Service {
         float high  = Math.min(clamp(mConfig.get("dp_gain_max", Config.DEFAULT_DP_GAIN_MAX), 0, 15), base);
         float extra = clamp(mConfig.get("bass_low",    Config.DEFAULT_BASS_LOW),    0, 10);
         float g = base + extra * lowFactor(r) + (high - base) * tailFactor(r);
+        /* Bass tone: the offset applies in full up to the knee, then shrinks to 40% at maximum
+         * volume, so turning the bass up can never bring back stutter at high volume. */
+        float tone = clamp(mConfig.get("tone_bass", Config.DEFAULT_TONE_BASS), -6, 6);
+        g += tone * (1f - 0.6f * tailFactor(r));
         g = Math.max(0f, Math.min(15f, g));
         return Math.round(g * 2f) / 2f; /* 0.5 dB steps */
     }

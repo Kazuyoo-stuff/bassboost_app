@@ -60,6 +60,10 @@ public class Config extends SQLiteOpenHelper {
     public static final int DEFAULT_DTS_LOW          = 0;    /* dB the vendor EQ boosts at 100-300 Hz (0-10) */
     public static final int DEFAULT_DTS_MID          = 0;    /* dB the vendor EQ cuts at 1-3 kHz (0-8) */
 
+    /* New in v1.6: volume-aware tone control. Defaults = off (0 dB). */
+    public static final int DEFAULT_TONE_BASS        = 0;    /* dB, -6..+6 */
+    public static final int DEFAULT_TONE_TREBLE      = 0;    /* dB, -6..+6 */
+
     private boolean mFresh = false; /* true when the database was created by this run */
 
     private final Map<String, Integer> mCache = new ConcurrentHashMap<>();
@@ -98,6 +102,8 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "knee",             DEFAULT_KNEE);
         insert(db, "dts_low",          DEFAULT_DTS_LOW);
         insert(db, "dts_mid",          DEFAULT_DTS_MID);
+        insert(db, "tone_bass",        DEFAULT_TONE_BASS);
+        insert(db, "tone_treble",      DEFAULT_TONE_TREBLE);
     }
 
     @Override
