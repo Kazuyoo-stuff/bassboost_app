@@ -67,6 +67,7 @@ public class BassService extends Service {
     public static final String ACTION_SET_DTS_LOW          = "dev.kazuyoo.bassboost.SET_DTS_LOW";
     public static final String ACTION_SET_DTS_MID          = "dev.kazuyoo.bassboost.SET_DTS_MID";
     public static final String ACTION_SET_TONE_BASS        = "dev.kazuyoo.bassboost.SET_TONE_BASS";
+    public static final String ACTION_SET_MUD_CUT          = "dev.kazuyoo.bassboost.SET_MUD_CUT";
     public static final String ACTION_SET_TONE_TREBLE      = "dev.kazuyoo.bassboost.SET_TONE_TREBLE";
     public static final String EXTRA_VALUE                 = "value";
 
@@ -102,15 +103,15 @@ public class BassService extends Service {
         "dp_gain", "bass_depth", "bass_body", "limiter_release",
         "adaptive", "knee", "dp_gain_max", "bass_low",
         "loudness_low", "vocal_smooth", "treble_cut", "speaker_only",
-        "dts_low", "dts_mid", "tone_bass", "tone_treble"
+        "dts_low", "dts_mid", "tone_bass", "tone_treble", "mud_cut"
     };
 
     private static final int[][] PRESETS = {
-        /* 0 off      */ { 0, 0, 150, 0,   8,  0, 60, 200,  0, 60, 3, 0,   0, 0, 0, 1,  0, 0,  0, 0 },
-        /* 1 soft     */ { 0, 1, 150, 1,   8,  0, 50, 200,  1, 40, 3, 3, 200, 1, 2, 1,  0, 0,  0, 0 },
-        /* 2 balanced */ { 0, 1, 150, 1,  11,  0, 60, 200,  1, 40, 3, 4, 250, 2, 3, 1,  0, 0,  0, 0 },
-        /* 3 heavy    */ { 0, 1, 150, 1,  13, 10, 65, 200,  1, 45, 4, 5, 250, 2, 3, 1,  0, 0,  0, 0 },
-        /* 4 dts      */ { 0, 1, 150, 1,  10,  0, 60, 200,  1, 40, 3, 4, 250, 0, 2, 1,  5, 5,  0, 0 },
+        /* 0 off      */ { 0, 0, 150, 0,   8,  0, 60, 200,  0, 60, 3, 0,   0, 0, 0, 1,  0, 0,  0, 0,  0 },
+        /* 1 soft     */ { 0, 1, 150, 1,   8,  0, 50, 200,  1, 40, 3, 3, 200, 1, 2, 1,  0, 0,  0, 0,  0 },
+        /* 2 balanced */ { 0, 1, 150, 1,  11,  0, 60, 200,  1, 40, 3, 4, 250, 2, 3, 1,  0, 0,  0, 0,  0 },
+        /* 3 heavy    */ { 0, 1, 150, 1,  13, 10, 65, 200,  1, 45, 4, 5, 250, 2, 3, 1,  0, 0,  0, 0,  0 },
+        /* 4 dts      */ { 0, 1, 150, 1,  10,  0, 50, 200,  1, 40, 3, 4, 250, 0, 1, 1,  5, 5,  0, 0,  3 },
     };
     private static final long  POLL_MS = 500;
 
@@ -292,6 +293,10 @@ public class BassService extends Service {
                 break;
             case ACTION_SET_LIMITER_RELEASE:
                 mConfig.set("limiter_release", clamp(value, 40, 400));
+                syncDp();
+                break;
+            case ACTION_SET_MUD_CUT:
+                mConfig.set("mud_cut", clamp(value, 0, 8));
                 syncDp();
                 break;
             case ACTION_SET_TONE_BASS:
@@ -515,7 +520,10 @@ public class BassService extends Service {
         dp.setPreEqBandAllChannelsTo(0, new DynamicsProcessing.EqBand(true, cut[0], g * depth));
         dp.setPreEqBandAllChannelsTo(1, new DynamicsProcessing.EqBand(true, cut[1], g));
         float body = clamp(mConfig.get("bass_body", Config.DEFAULT_BASS_BODY), 0, 100) / 100f;
-        dp.setPreEqBandAllChannelsTo(2, new DynamicsProcessing.EqBand(true, cut[2], g * body));
+        /* Mud cut: pulls 150-300 Hz down below the punch region. A boomy, "mendem" sound comes
+         * from too much energy here, which stacks with the vendor EQ boost at 300 Hz. */
+        float mud = clamp(mConfig.get("mud_cut", Config.DEFAULT_MUD_CUT), 0, 8);
+        dp.setPreEqBandAllChannelsTo(2, new DynamicsProcessing.EqBand(true, cut[2], g * body - mud));
         if (mDpBands == 6) {
             float v = clamp(mConfig.get("vocal_smooth", Config.DEFAULT_VOCAL_SMOOTH), 0, 6);
             /* give back half of what the vendor EQ cuts at 1-3 kHz, so vocals do not sink */

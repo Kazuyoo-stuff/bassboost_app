@@ -64,6 +64,9 @@ public class Config extends SQLiteOpenHelper {
     public static final int DEFAULT_TONE_BASS        = 0;    /* dB, -6..+6 */
     public static final int DEFAULT_TONE_TREBLE      = 0;    /* dB, -6..+6 */
 
+    /* New in v1.7. Default = off. */
+    public static final int DEFAULT_MUD_CUT          = 0;    /* dB cut at 150-300 Hz against a boomy, muffled sound (0-8) */
+
     private boolean mFresh = false; /* true when the database was created by this run */
 
     private final Map<String, Integer> mCache = new ConcurrentHashMap<>();
@@ -104,6 +107,7 @@ public class Config extends SQLiteOpenHelper {
         insert(db, "dts_mid",          DEFAULT_DTS_MID);
         insert(db, "tone_bass",        DEFAULT_TONE_BASS);
         insert(db, "tone_treble",      DEFAULT_TONE_TREBLE);
+        insert(db, "mud_cut",          DEFAULT_MUD_CUT);
     }
 
     @Override
